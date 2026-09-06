@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="900" viewBox="0 0 1280 900">
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title { font: 700 28px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .layer-title { font: 700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111827; }
+      .box-title { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111827; }
+      .box-text { font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #334155; }
+      .small { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .hint { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f766e; }
+      .layer { stroke-width: 3; rx: 22; }
+      .box { fill: #ffffff; stroke-width: 2; rx: 12; filter: drop-shadow(0 4px 7px rgba(15, 23, 42, 0.12)); }
+      .arrow-blue { stroke: #2563eb; stroke-width: 3; fill: none; marker-end: url(#arrow-blue); }
+      .arrow-green { stroke: #059669; stroke-width: 3; fill: none; marker-end: url(#arrow-green); stroke-dasharray: 8 7; }
+      .arrow-slate { stroke: #475569; stroke-width: 2.5; fill: none; marker-end: url(#arrow-slate); }
+    </style>
+  </defs>
+
+  <rect width="1280" height="900" fill="#f8fafc"/>
+  <text x="640" y="42" text-anchor="middle" class="title">深度研搜系统架构图</text>
+  <text x="640" y="70" text-anchor="middle" class="small">前端提交任务 -> FastAPI 后台协程 -> DeepAgents 调度多来源工具 -> WebSocket 回传进度 -> Markdown / PDF 交付</text>
+
+  <!-- 用户交互层 -->
+  <rect x="24" y="92" width="1232" height="118" class="layer" fill="#e0f2fe" stroke="#0284c7"/>
+  <text x="48" y="126" class="layer-title">用户交互层</text>
+  <rect x="260" y="118" width="220" height="66" class="box" stroke="#0284c7"/>
+  <text x="370" y="144" text-anchor="middle" class="box-title">React + Vite 前端</text>
+  <text x="370" y="168" text-anchor="middle" class="box-text">对话、上传、文件列表</text>
+  <rect x="545" y="118" width="220" height="66" class="box" stroke="#0284c7"/>
+  <text x="655" y="144" text-anchor="middle" class="box-title">HTTP 命令通道</text>
+  <text x="655" y="168" text-anchor="middle" class="box-text">任务 / 上传 / 下载</text>
+  <rect x="830" y="118" width="220" height="66" class="box" stroke="#0284c7"/>
+  <text x="940" y="144" text-anchor="middle" class="box-title">WebSocket 进度通道</text>
+  <text x="940" y="168" text-anchor="middle" class="box-text">工具事件 / 结果 / 异常</text>
+
+  <!-- API layer -->
+  <rect x="24" y="232" width="1232" height="142" class="layer" fill="#ecfdf5" stroke="#16a34a"/>
+  <text x="48" y="266" class="layer-title">API 与实时通信层</text>
+  <rect x="70" y="292" width="210" height="58" class="box" stroke="#16a34a"/>
+  <text x="175" y="316" text-anchor="middle" class="box-title">FastAPI server.py</text>
+  <text x="175" y="339" text-anchor="middle" class="box-text">lifespan 绑定事件循环</text>
+  <rect x="340" y="292" width="210" height="58" class="box" stroke="#16a34a"/>
+  <text x="445" y="316" text-anchor="middle" class="box-title">任务接口</text>
+  <text x="445" y="339" text-anchor="middle" class="box-text">/api/task + active_tasks</text>
+  <rect x="610" y="292" width="210" height="58" class="box" stroke="#16a34a"/>
+  <text x="715" y="316" text-anchor="middle" class="box-title">文件接口</text>
+  <text x="715" y="339" text-anchor="middle" class="box-text">upload / files / download</text>
+  <rect x="880" y="292" width="250" height="58" class="box" stroke="#16a34a"/>
+  <text x="1005" y="316" text-anchor="middle" class="box-title">ConnectionManager</text>
+  <text x="1005" y="339" text-anchor="middle" class="box-text">thread_id -> websocket</text>
+
+  <!-- Agent layer -->
+  <rect x="24" y="398" width="1232" height="164" class="layer" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="48" y="432" class="layer-title">DeepAgents 调度层</text>
+  <rect x="74" y="462" width="230" height="66" class="box" stroke="#f59e0b"/>
+  <text x="189" y="488" text-anchor="middle" class="box-title">main_agent.py</text>
+  <text x="189" y="512" text-anchor="middle" class="box-text">create_deep_agent</text>
+  <rect x="370" y="462" width="230" height="66" class="box" stroke="#f59e0b"/>
+  <text x="485" y="488" text-anchor="middle" class="box-title">run_deep_agent</text>
+  <text x="485" y="512" text-anchor="middle" class="box-text">创建会话目录并 astream</text>
+  <rect x="666" y="462" width="230" height="66" class="box" stroke="#f59e0b"/>
+  <text x="781" y="488" text-anchor="middle" class="box-title">ContextVar</text>
+  <text x="781" y="512" text-anchor="middle" class="box-text">thread_id / session_dir</text>
+  <rect x="962" y="462" width="230" height="66" class="box" stroke="#f59e0b"/>
+  <text x="1077" y="488" text-anchor="middle" class="box-title">monitor.py</text>
+  <text x="1077" y="512" text-anchor="middle" class="box-text">assistant / tool / result</text>
+
+  <!-- Workers/tools layer -->
+  <rect x="24" y="586" width="1232" height="168" class="layer" fill="#f3e8ff" stroke="#9333ea"/>
+  <text x="48" y="620" class="layer-title">子智能体与工具层</text>
+  <rect x="54" y="648" width="220" height="72" class="box" stroke="#9333ea"/>
+  <text x="164" y="675" text-anchor="middle" class="box-title">网络搜索助手</text>
+  <text x="164" y="699" text-anchor="middle" class="box-text">Tavily internet_search</text>
+  <rect x="328" y="648" width="230" height="72" class="box" stroke="#9333ea"/>
+  <text x="443" y="675" text-anchor="middle" class="box-title">数据库查询助手</text>
+  <text x="443" y="699" text-anchor="middle" class="box-text">list / preview / execute SQL</text>
+  <rect x="612" y="648" width="230" height="72" class="box" stroke="#9333ea"/>
+  <text x="727" y="675" text-anchor="middle" class="box-title">RAGFlow 助手</text>
+  <text x="727" y="699" text-anchor="middle" class="box-text">助手列表 / 临时会话问答</text>
+  <rect x="896" y="648" width="300" height="72" class="box" stroke="#9333ea"/>
+  <text x="1046" y="675" text-anchor="middle" class="box-title">文件交付工具</text>
+  <text x="1046" y="697" text-anchor="middle" class="box-text">read_file_content / generate_markdown</text>
+  <text x="1046" y="716" text-anchor="middle" class="box-text">convert_md_to_pdf</text>
+
+  <!-- Data/output layer -->
+  <rect x="24" y="778" width="1232" height="96" class="layer" fill="#f1f5f9" stroke="#475569"/>
+  <text x="48" y="812" class="layer-title">数据源与产物层</text>
+  <rect x="192" y="822" width="155" height="36" class="box" stroke="#475569"/>
+  <text x="270" y="846" text-anchor="middle" class="box-text">公开网页 / 新闻</text>
+  <rect x="397" y="822" width="155" height="36" class="box" stroke="#475569"/>
+  <text x="475" y="846" text-anchor="middle" class="box-text">MySQL 业务库</text>
+  <rect x="602" y="822" width="155" height="36" class="box" stroke="#475569"/>
+  <text x="680" y="846" text-anchor="middle" class="box-text">RAGFlow 知识库</text>
+  <rect x="807" y="822" width="170" height="36" class="box" stroke="#475569"/>
+  <text x="892" y="846" text-anchor="middle" class="box-text">updated/session</text>
+  <rect x="1027" y="822" width="170" height="36" class="box" stroke="#475569"/>
+  <text x="1112" y="846" text-anchor="middle" class="box-text">output: MD / PDF</text>
+
+  <!-- arrows main flow -->
+  <path class="arrow-blue" d="M 655 184 L 655 292"/>
+  <path class="arrow-blue" d="M 445 350 L 445 462"/>
+  <path class="arrow-slate" d="M 280 321 L 340 321"/>
+  <path class="arrow-slate" d="M 550 321 L 610 321"/>
+  <path class="arrow-green" d="M 940 184 L 1005 292"/>
+  <path class="arrow-slate" d="M 304 495 L 370 495"/>
+  <path class="arrow-slate" d="M 600 495 L 666 495"/>
+  <path class="arrow-slate" d="M 896 495 L 962 495"/>
+  <path class="arrow-blue" d="M 485 528 C 485 575 443 595 443 648"/>
+  <path class="arrow-blue" d="M 485 528 C 485 575 164 595 164 648"/>
+  <path class="arrow-blue" d="M 485 528 C 485 575 727 595 727 648"/>
+  <path class="arrow-blue" d="M 485 528 C 485 575 1046 595 1046 648"/>
+  <path class="arrow-slate" d="M 164 720 C 164 770 270 772 270 822"/>
+  <path class="arrow-slate" d="M 443 720 C 443 770 475 772 475 822"/>
+  <path class="arrow-slate" d="M 727 720 C 727 770 680 772 680 822"/>
+  <path class="arrow-slate" d="M 1046 720 C 1046 770 892 772 892 822"/>
+  <path class="arrow-slate" d="M 1046 720 C 1046 770 1112 772 1112 822"/>
+
+  <!-- websocket return arrow -->
+  <path class="arrow-green" d="M 1077 462 C 1188 430 1195 230 1010 184"/>
+  <text x="1172" y="250" text-anchor="middle" class="hint">WebSocket 实时回传</text>
+  <text x="1172" y="270" text-anchor="middle" class="small">tool_start / assistant_call</text>
+  <text x="1172" y="289" text-anchor="middle" class="small">task_result / error</text>
+
+  <!-- labels -->
+  <text x="610" y="236" class="hint">HTTP 发命令，WebSocket 回进度</text>
+  <text x="42" y="392" class="small">server.py 只做轻量调度，真正长耗时任务交给后台协程</text>
+  <text x="42" y="580" class="small">主智能体负责判断信息缺口，子智能体只处理自己的信息来源，文件工具负责最终交付</text>
+</svg>

@@ -1,0 +1,39 @@
+Java 语言介绍
+================
+
+一、起源与发展
+Java 由 Sun Microsystems 公司的 James Gosling 等人于 20 世纪 90 年代初开发，最初名为 Oak（橡树），目标是用于消费类电子设备（如机顶盒）的嵌入式编程。1995 年，Sun 公司正式发布 Java 1.0，并提出核心口号 "Write Once, Run Anywhere"（一次编写，到处运行）。1996 年 JDK 1.0 正式推出。2009 年 Oracle 公司收购 Sun Microsystems，自此 Java 由 Oracle 主导维护与发展。
+
+二、主要特点
+1. 跨平台性：Java 源代码被编译为与平台无关的字节码（Bytecode），运行在 Java 虚拟机（JVM）上，实现"一次编译，到处运行"。
+2. 面向对象：几乎一切皆对象，支持封装、继承、多态三大特性，并强调基于类和接口的编程模型。
+3. 自动垃圾回收（GC）：JVM 自动管理内存的分配与回收，显著降低内存泄漏和手动管理内存的风险。
+4. 健壮与安全：强类型检查、完善的异常处理机制、无指针算术、内置安全管理机制，编译期即可发现大量错误。
+5. 多线程支持：语言与标准库层面内置多线程和并发编程能力（synchronized、java.util.concurrent、虚拟线程等）。
+6. 丰富的标准库（JDK）：涵盖集合、I/O、网络、并发、GUI、数据库连接（JDBC）、XML/JSON 处理等广泛领域。
+7. 动态生态与向后兼容：拥有庞大的第三方开源生态（Maven/Gradle、Spring 等），并长期保持较好的向后兼容性。
+
+三、主要应用领域
+- 企业级后端开发：广泛应用于金融、电商、通信等大型系统，代表框架有 Spring Boot、Spring Cloud、Jakarta EE。
+- Android 移动开发：Android 平台原生应用的主要开发语言（常与 Kotlin 并用）。
+- 大数据处理：Hadoop、Spark、Flink、Kafka 等主流大数据与流处理框架均基于 Java / JVM 生态构建。
+- 云计算与微服务：Spring Cloud、Quarkus、Micronaut 等框架广泛用于云原生应用开发。
+- 桌面应用：通过 JavaFX、Swing 等 GUI 框架开发跨平台桌面软件。
+- 嵌入式与物联网：Java ME 及相关技术在嵌入式设备、车载系统等领域仍有应用。
+- 金融与交易系统：凭借稳定性与性能，在银行核心系统、证券交易等场景被大量使用。
+
+四、版本历史概要
+- JDK 1.0（1996）：首个正式版本。
+- JDK 1.2 / Java 2（1998）：引入 Collections 框架、Swing GUI、JIT 编译优化。
+- JDK 5（2004）：重大更新——泛型、注解、枚举、自动装箱/拆箱、增强 for 循环、并发工具包。
+- JDK 8（2014）：里程碑版本——Lambda 表达式、Stream API、Optional、新的日期时间 API（java.time）、接口默认方法。
+- JDK 9（2017）：模块化系统（JPMS）、REPL 工具 jshell。
+- JDK 11 LTS（2018）：HTTP Client 标准化、ZGC 实验特性、移除 Java EE 与 CORBA 模块。
+- JDK 17 LTS（2021）：密封类（sealed class）、模式匹配预览、增强型伪随机数生成器、强封装 JDK 内部 API。
+- JDK 21 LTS（2023）：虚拟线程（Virtual Threads）、记录模式（Record Patterns）、switch 模式匹配正式化。
+- JDK 25 LTS（2025）：最新长期支持版本，包含向量 API、紧凑对象头等持续演进。
+
+自 JDK 9 起，Oracle 改为每半年发布一个新版本的快速迭代模式，每 2~3 年发布一个 LTS（长期支持）版本。目前业界主流生产环境以 JDK 8、JDK 11、JDK 17、JDK 21 及新一代 JDK 25 为主。
+
+五、总结
+Java 历经近 30 年发展，凭借其跨平台能力、稳健的类型系统、完善的生态体系和庞大的社区支持，长期位居全球最流行编程语言前列。它既是构建企业级系统的中坚力量，也是大数据、云计算与 Android 生态的重要基石，未来仍将持续演进。
