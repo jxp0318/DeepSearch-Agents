@@ -2,10 +2,29 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run app.agent.graph",
+            "name": "Run backend (uvicorn app.api.server:app)",
             "type": "debugpy",
             "request": "launch",
-            "module": "app.agent.graph",
+            "module": "uvicorn",
+            "args": [
+                "app.api.server:app",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8001",
+                "--reload"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Run start.py (backend + frontend)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/start.py",
             "cwd": "${workspaceFolder}",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"
