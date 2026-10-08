@@ -30,8 +30,12 @@ reportlab>=4.0.0            # 跨平台 PDF 生成，用于 word_converter.py
 
 # --- 外部工具集成 (Integrations) ---
 tavily-python==0.7.24       # 联网搜索 API
-ragflow-sdk>=0.1.0          # 知识库 SDK
 requests>=2.31.0            # HTTP 请求库
+
+# --- 自建 RAG (Knowledge Base Retrieval) ---
+numpy>=1.26.0               # 向量矩阵与相似度计算
+jieba>=0.42.1               # 中文分词（BM25 检索的分词器）
+rank-bm25>=0.2.2            # Okapi BM25 关键词检索
 
 # --- 基础工具 (Utilities) ---
 PyYAML>=6.0                 # YAML 配置文件解析，用于 prompts.py

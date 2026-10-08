@@ -1,6 +1,6 @@
 # deepsearch-agents
 
-deepsearch-agents 是一个面向复杂研究任务的对话式多智能体系统。用户可以通过浏览器提交研究问题、上传参考文件，并实时查看任务执行过程。系统会根据任务内容调度不同的专业智能体，从公开网络、MySQL 数据库、RAGFlow 知识库和用户附件中收集信息，最后生成回答、Markdown 报告或 PDF 文件。
+deepsearch-agents 是一个面向复杂研究任务的对话式多智能体系统。用户可以通过浏览器提交研究问题、上传参考文件，并实时查看任务执行过程。系统会根据任务内容调度不同的专业智能体，从公开网络、MySQL 数据库、自建 RAG 知识库和用户附件中收集信息，最后生成回答、Markdown 报告或 PDF 文件。
 
 ![deepsearch-agents 首页](docs/images/deepsearch-agent-home.jpg)
 
@@ -24,7 +24,7 @@ FastAPI 创建独立会话
         ↓
 主智能体分析任务并制定执行计划
         ↓
-调度网络搜索、数据库查询或 RAGFlow 知识库智能体
+调度网络搜索、数据库查询或知识库检索智能体
         ↓
 汇总多来源信息，产出本轮结果
         ↓
@@ -45,7 +45,7 @@ deepsearch-agents/
 │  ├─ agent/              智能体配置、提示词、调度逻辑与反思循环
 │  ├─ api/                FastAPI 接口与 WebSocket 服务
 │  ├─ prompt/             提示词配置
-│  ├─ ragflow/            RAGFlow 配置与调用示例
+│  ├─ rag/                自建 RAG：文档摄入、切分、双路检索（BM25+向量）
 │  ├─ tools/              搜索、数据库、文件和知识库工具
 │  ├─ utils/              路径处理与文档转换工具
 │  └─ output/             任务生成的文件
@@ -135,9 +135,11 @@ TAVILY_BACKOFF_BASE=0.8
 # TAVILY_HTTP_PROXY=http://127.0.0.1:7890
 # TAVILY_HTTPS_PROXY=http://127.0.0.1:7890
 
-# RAGFlow
-RAGFLOW_API_URL=你的_RAGFlow_服务地址
-RAGFLOW_API_KEY=你的_RAGFlow_API_KEY
+# 自建 RAG embedding（可选，留空时检索自动降级为纯 BM25，知识库能力仍可用）
+# 需要是 OpenAI 兼容协议的 /embeddings 端点
+# EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+# EMBEDDING_API_KEY=你的_embedding_API_KEY
+# EMBEDDING_MODEL=BAAI/bge-m3
 
 # MySQL
 MYSQL_USER=root
@@ -154,7 +156,14 @@ REFLECTION_MAX_ROUNDS=3
 REFLECTION_TOKEN_BUDGET=150000
 ```
 
-至少需要正确配置大模型接口和密钥。未配置 Tavily、MySQL 或 RAGFlow 时，对应的网络搜索、数据库查询或知识库能力将不可用。
+至少需要正确配置大模型接口和密钥。未配置 Tavily 或 MySQL 时，对应的网络搜索或数据库查询能力将不可用；知识库检索默认以纯 BM25 模式运行，配置 embedding 端点后自动升级为「关键词 + 向量语义」双路融合。
+
+首次使用知识库前，需要摄入本地文档生成索引（docs/knowledge_base 下每个子目录是一个知识库）：
+
+```bash
+python -m app.rag.ingest          # 增量摄入
+python -m app.rag.ingest --force  # 全量重建
+```
 
 ### 5. 启动 MySQL
 

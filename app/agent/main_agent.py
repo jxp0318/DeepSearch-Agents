@@ -39,7 +39,7 @@ from app.tools.upload_file_read_tool import read_file_content
 
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件工具
-# 2. subagents 放网络、数据库、RAGFlow 三类信息获取助手
+# 2. subagents 放网络、数据库、自建知识库（RAG）三类信息获取助手
 # 3. checkpointer 通过 thread_id 保存同一会话中的执行上下文
 main_agent = create_deep_agent(
     model=model,

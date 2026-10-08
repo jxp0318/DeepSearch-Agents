@@ -23,6 +23,7 @@ frontend/.vite/
 
 # Runtime output and temporary files
 app/output/
+app/rag/indexes/
 tmp/
 *.log
 
