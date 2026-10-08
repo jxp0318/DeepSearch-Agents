@@ -42,20 +42,21 @@ def require_file(path: Path, hint: str) -> bool:
     return False
 
 
-def start_mysql() -> None:
+def start_services() -> None:
+    """启动 docker 内的本地服务（MySQL / embedding / Qdrant / Elasticsearch）"""
     docker = shutil.which("docker.exe") or shutil.which("docker")
     if not docker:
-        print("未找到 Docker，跳过 MySQL 教学库。")
+        print("未找到 Docker，跳过本地服务（MySQL / embedding / Qdrant / Elasticsearch）。")
         return
 
     info = subprocess.run(
         [docker, "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
     )
     if info.returncode != 0:
-        print("Docker Desktop 未启动，跳过 MySQL 教学库。")
+        print("Docker Desktop 未启动，跳过本地服务。")
         return
 
-    print("启动 MySQL 教学库...")
+    print("启动本地服务（MySQL / embedding / Qdrant / Elasticsearch）...")
     result = subprocess.run(
         [
             docker,
@@ -71,7 +72,7 @@ def start_mysql() -> None:
         check=False,
     )
     if result.returncode:
-        print("MySQL 启动失败，已继续启动前后端；数据库查询功能可能不可用。")
+        print("本地服务启动失败，已继续启动前后端；数据库查询与知识库检索将按降级链运行。")
 
 
 def start_service(command: list[str], working_directory: Path) -> subprocess.Popen[bytes]:
@@ -111,7 +112,7 @@ def main() -> int:
         pause()
         return 1
 
-    start_mysql()
+    start_services()
     print("启动后端...")
     start_service(
         [

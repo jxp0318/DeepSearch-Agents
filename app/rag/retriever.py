@@ -1,20 +1,24 @@
 """
 知识库检索模块
 
-双路检索架构：
-1. BM25 路（始终可用）：jieba 分词 + Okapi BM25，覆盖关键词精确匹配
-2. 向量路（Qdrant）：query embedding 与 Qdrant 中的 chunk 向量做相似度检索，覆盖语义改写
+双路检索架构，两路都是「可选增强 + 可降级」：
+1. 关键词路：Elasticsearch（IK 中文分词 + 倒排索引 + BM25 打分）—— 见 ADR-008；
+   ES 不可达时回退进程内 rank_bm25（jieba 分词 + Okapi BM25），功能不消失
+2. 向量路：Qdrant（query embedding 与 chunk 向量做余弦相似度）—— 见 ADR-007；
+   embedding 未配置或 Qdrant 不可达时该路缺席
 
-两路结果用 RRF（Reciprocal Rank Fusion）融合排序——两路得分量纲不可比
-（词频统计 vs 余弦），RRF 只看排名不看分值，天然免调参。
+两路结果用 RRF（Reciprocal Rank Fusion）融合排序——得分量纲不可比
+（BM25 词频统计 vs 余弦），RRF 只看排名不看分值，天然免调参。
 
-可用性三级降级（见 ADR-006 / ADR-007）：
-- embedding 未配置              → 纯 BM25
-- embedding 已配置但 Qdrant 不可达 → 纯 BM25（不报错、不阻塞任务）
-- 两者就绪                       → 双路 RRF 融合
+可用性降级链：
+- ES 可达 + 向量路就绪            → 关键词(ES) + 向量 双路 RRF（最佳）
+- ES 不可达                       → 关键词路回退进程内 rank_bm25
+- embedding 未配置 / Qdrant 不可达 → 向量路缺席，仅关键词路（单路同样返回结果）
+- 两路都不可用                     → 进程内 rank_bm25 兜底，知识库能力始终可用
 
-存储分工：原文在本地 chunks.jsonl（BM25 依赖），向量在 Qdrant（向量路依赖），
-两路结果通过 chunk 在 jsonl 中的行号（seq）对齐，融合与取原文都靠它。
+存储分工：原文权威副本在本地 chunks.jsonl（本地 BM25 与 seq 对齐基准），
+向量在 Qdrant、关键词索引在 ES；三处通过 chunk 在 jsonl 中的行号（seq）对齐，
+融合与取原文都靠它。
 索引按知识库懒加载并缓存：首次查询后常驻内存，进程内重复查询零 IO。
 """
 
@@ -45,7 +49,8 @@ class Retriever:
 
     def __init__(self) -> None:
         self._indexes: dict[str, KBIndex] = {}
-        self._vector_degraded = False  # 向量库降级只告警一次，避免刷屏
+        self._vector_degraded = False   # 向量路降级只告警一次，避免刷屏
+        self._keyword_degraded = False  # 关键词路回退本地 BM25 同样只告警一次
 
     # ---------- 索引加载 ----------
 
@@ -104,8 +109,9 @@ class Retriever:
         :param kb_name: 知识库目录名
         :param query: 检索问题
         :param top_k: 返回条数，缺省用 config.DEFAULT_TOP_K
-        :param mode: hybrid（默认，双路 RRF 融合）| bm25 | vector
-                     后两种仅用于评测对比检索质量，生产路径走 hybrid
+        :param mode: hybrid（默认，双路 RRF 融合）| keyword（仅关键词路）
+                     | bm25（仅进程内 BM25）| vector（仅向量路）
+                     后三种仅用于评测对比检索质量，生产路径走 hybrid
         :return: [{...chunk 字段, "score": 融合排名分}]，得分越高越相关
         """
         top_k = top_k or config.DEFAULT_TOP_K
@@ -116,7 +122,10 @@ class Retriever:
         # 两路候选各取 3 倍 top_k，给 RRF 融合留足交集空间
         candidate_k = top_k * 3
         rankings: list[list[tuple[int, float]]] = []
-        if mode in ("hybrid", "bm25"):
+        if mode in ("hybrid", "keyword"):
+            rankings.append(self._keyword_search_safe(kb_name, index, query, candidate_k))
+        if mode == "bm25":
+            # 仅进程内 BM25：评测对照用，用于量化「ES 关键词路」相对手写实现的增益
             rankings.append(self._bm25_search(index, query, candidate_k))
         if mode in ("hybrid", "vector"):
             vector_ranking = self._vector_search_safe(kb_name, query, candidate_k)
@@ -134,6 +143,33 @@ class Retriever:
             chunk["score"] = round(score, 4)
             results.append(chunk)
         return results
+
+    def _keyword_search_safe(
+        self, kb_name: str, index: KBIndex, query: str, k: int
+    ) -> list[tuple[int, float]]:
+        """
+        关键词路检索：Elasticsearch 优先，任何失败都回退进程内 BM25
+
+        关键词路是知识库检索的基本盘——ES 没启动、索引未就绪或查询超时，
+        都不应该让检索失败；退回进程内 rank_bm25 仍能拿到结果（功能不消失，
+        只是少了倒排索引与 IK 分词带来的精度）。
+        """
+        if not config.ES_ENABLED:
+            return self._bm25_search(index, query, k)
+        try:
+            from app.rag.keyword_store import ElasticsearchUnavailable, keyword_store
+
+            return keyword_store.search(kb_name, query, k)
+        except ElasticsearchUnavailable as e:
+            if not self._keyword_degraded:
+                logger.warning("ES 关键词检索不可用，已回退进程内 BM25: %s", e)
+                self._keyword_degraded = True
+            return self._bm25_search(index, query, k)
+        except Exception as e:  # noqa: BLE001 —— 兜底：任何异常都不应中断检索
+            if not self._keyword_degraded:
+                logger.warning("ES 关键词检索异常，已回退进程内 BM25: %s", e)
+                self._keyword_degraded = True
+            return self._bm25_search(index, query, k)
 
     def _vector_search_safe(
         self, kb_name: str, query: str, k: int

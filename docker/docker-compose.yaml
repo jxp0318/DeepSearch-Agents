@@ -1,17 +1,25 @@
-# DeepSearch Agents 本地服务环境（MySQL + 本地 embedding 服务 + Qdrant 向量库）
+# DeepSearch Agents 本地服务环境
+# （MySQL 业务数据 + 本地 embedding 服务 + Qdrant 向量库 + Elasticsearch 关键词索引）
 #
 # 运行位置：在项目根目录执行
 #   docker compose --env-file .env -f docker/docker-compose.yaml up -d
 # 首次启动时，mysql/mysql.sql 会被官方镜像自动导入到 deepsearch_db。
 # 如果数据卷已存在，MySQL 不会重复执行初始化脚本，需要重建 volume 才会重新导入。
 #
-# 三个服务都是「可选」的，缺任何一个系统仍能跑：
-#   mysql      业务数据信源（未启动时数据库查询助手不可用）
-#   embedding  自建 RAG 的向量化后端（见 ADR-006）：HuggingFace text-embeddings-inference
-#              加载 bge-large-zh-v1.5，提供原生 /embed 与 OpenAI 兼容的 /v1/embeddings（1024 维）。
-#              模型文件需放在 docker/embedding/bge-large-zh-v1.5/（约 1.3GB，不入 git）
-#   qdrant     向量库（见 ADR-007）：存放 chunk 向量，与 BM25 组成双路检索
-# embedding 或 qdrant 未启动时，知识库检索自动降级为纯 BM25，不影响系统其余功能。
+# 服务都是「可选」的，缺任何一个系统仍能跑：
+#   mysql        业务数据信源（未启动时数据库查询助手不可用）
+#   embedding    自建 RAG 的向量化后端（见 ADR-006）：HuggingFace text-embeddings-inference
+#                加载 bge-large-zh-v1.5，提供原生 /embed 与 OpenAI 兼容的 /v1/embeddings（1024 维）。
+#                模型文件需放在 docker/embedding/bge-large-zh-v1.5/（约 1.3GB，不入 git）
+#   qdrant       向量库（见 ADR-007）：存放 chunk 向量，与关键词路组成双路检索
+#   elasticsearch 关键词检索路（见 ADR-008）：自建镜像装 IK 中文分词，
+#                与 Qdrant 对称——Qdrant 存向量、ES 存原文倒排索引
+#   kibana       可选可视化（profile: kibana），按需启动：
+#                docker compose --env-file .env -f docker/docker-compose.yaml --profile kibana up -d kibana
+#
+# 降级行为：embedding / qdrant / elasticsearch 任一未启动时，检索自动降级——
+# ES 不可达则关键词路回退进程内 rank_bm25，Qdrant 不可达则向量路缺席，
+# 最差情况仍有纯关键词检索可用，不影响系统其余功能。
 
 name: deepsearch-agents
 
@@ -95,6 +103,55 @@ services:
       retries: 10
       start_period: 15s
 
+  elasticsearch:
+    # 关键词检索路（见 ADR-008）：IK 中文分词 + 倒排索引 + BM25 打分
+    # 自建镜像只做一件事——把 analysis-ik 插件装进去（插件包随仓库提供，构建不联网）
+    build: ./elasticsearch
+    image: deepsearch-elasticsearch:8.19.10
+    container_name: deepsearch-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      # 本地开发关闭 xpack 安全：省去证书与账号配置（生产环境必须开启）
+      xpack.security.enabled: "false"
+      # 本机总内存约 8GB，且要同时跑 embedding（1.3G 模型）与 qdrant；
+      # 617 个 chunk 的索引极小，512MB heap 绰绰有余，
+      # 不限制的话 ES 会按宿主内存取一半（2GB+）把机器吃紧
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      TZ: Asia/Shanghai
+    ports:
+      # 默认 9201，避开本机可能已被占用的 9200（如电商问数项目的 elasticsearch 容器）
+      - "${ES_PORT:-9201}:9200"
+    volumes:
+      - deepsearch_es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  kibana:
+    # 可选可视化：ES 的数据浏览与检索调试（对应 Qdrant 自带的 dashboard）
+    # 默认不启动，需要时用 --profile kibana 显式开启（镜像约 2.1GB）
+    image: kibana:8.19.10
+    container_name: deepsearch-kibana
+    profiles: ["kibana"]
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      TZ: Asia/Shanghai
+    ports:
+      # 默认 5602，避开电商问数项目 kibana 用的 5601
+      - "${KIBANA_PORT:-5602}:5601"
+    volumes:
+      - deepsearch_kibana_data:/usr/share/kibana/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
 volumes:
   deepsearch_mysql_data:
   deepsearch_qdrant_data:
+  deepsearch_es_data:
+  deepsearch_kibana_data:

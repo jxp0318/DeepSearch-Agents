@@ -1,22 +1,24 @@
 """
 知识库摄入模块
 
-流水线：扫描知识库目录 → 提取 → 切分 → embedding（可选）→ 写入向量库 + 落盘原文。
-索引按知识库组织，原文与向量分两处存储（见 ADR-007）：
+流水线：扫描知识库目录 → 提取 → 切分 → 落盘原文 → embedding 写 Qdrant → 写 ES 关键词索引。
+索引按知识库组织，三处存储（见 ADR-007 / ADR-008）：
 
     app/rag/indexes/<kb_name>/chunks.jsonl   每个 chunk 一行 JSON（id / doc / heading / text）
     app/rag/indexes/<kb_name>/meta.json      文件哈希清单与索引模式，用于增量摄入与降级标记
-    Qdrant collection (payload.kb = <kb_name>)   chunk 向量 + 原文副本
+    Qdrant collection (payload.kb = <kb_name>)   chunk 向量
+    ES 索引 (字段 kb = <kb_name>)                chunk 原文与元数据（IK 分词倒排索引）
 
-两条数据通过 chunk 在 chunks.jsonl 中的行号（seq）对齐：BM25 走本地原文，
-向量走 Qdrant，检索时在应用层做 RRF 融合。
-embedding 未配置时不写向量，检索退回纯 BM25。
+三处通过 chunk 在 chunks.jsonl 中的行号（seq）对齐，检索时在应用层做 RRF 融合。
+chunks.jsonl 始终是原文权威副本：embedding 未配置则不写向量，ES 未启动则不写关键词索引，
+两者都只是可选增强——进程内 rank_bm25 会兜底关键词路，知识库能力不消失。
 
 增量策略：按文件 sha256 跳过未变化的文档，只重摄入新增或修改的文件。
 """
 
 import hashlib
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -24,7 +26,10 @@ import numpy as np
 
 from app.rag import config
 from app.rag.chunker import SUPPORTED_SUFFIXES, TextBlock, chunk_text, extract_document
+from app.rag.keyword_store import ElasticsearchUnavailable, keyword_store
 from app.rag.vector_store import QdrantUnavailable, vector_store
+
+logger = logging.getLogger(__name__)
 
 
 def _file_sha256(file_path: Path) -> str:
@@ -51,6 +56,12 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
     # 这里按字符数上限先裁一刀，保证任何配置下都不会因单条过长中断整批摄入
     texts = [t[: config.EMBEDDING_MAX_CHARS] for t in texts]
 
+    # 本地 embedding 服务一律直连、不走系统代理：requests 默认会读取环境变量里的
+    # HTTP_PROXY（开发机/CI 常注入代理），把 localhost 请求转发给代理会带来额外延迟，
+    # 并在大批量摄入时造成间歇性读超时（实测：报错里的连接端口是代理端口而非 8081）。
+    session = requests.Session()
+    session.trust_env = False
+
     headers = {"Authorization": f"Bearer {config.EMBEDDING_API_KEY}"}
     all_vectors: list[list[float]] = []
 
@@ -63,11 +74,11 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                resp = requests.post(
+                resp = session.post(
                     f"{config.EMBEDDING_BASE_URL}/embeddings",
                     headers=headers,
                     json=payload,
-                    timeout=30,
+                    timeout=config.EMBEDDING_TIMEOUT,
                 )
                 resp.raise_for_status()
                 data = resp.json()["data"]
@@ -89,11 +100,11 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
 
 def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
     """
-    摄入单个知识库：提取 → 切分 → 向量化 → 写向量库 + 落盘原文
+    摄入单个知识库：提取 → 切分 → 落盘原文 → 写向量库(Qdrant) + 写关键词索引(ES)
 
     :param kb_name: 知识库目录名（KNOWLEDGE_BASE_ROOT 下的直接子目录）
     :param force: True 时忽略文件哈希全量重建索引
-    :return: 摄入摘要 dict（文件数、chunk 数、是否启用向量、耗时）
+    :return: 摄入摘要 dict（文件数、chunk 数、是否启用向量/关键词索引、耗时）
     """
     kb_dir = config.KNOWLEDGE_BASE_ROOT / kb_name
     if not kb_dir.is_dir():
@@ -107,6 +118,13 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
     old_files: dict[str, str] = {}
     if meta_path.exists() and not force:
         old_files = json.loads(meta_path.read_text(encoding="utf-8")).get("files", {})
+
+    # 增量跳过前先校验后端数据完整性：文档没变、但某个后端（Qdrant / ES）的文档数
+    # 与本地原文索引对不上时，说明上次摄入半途失败或后端数据卷被清空——此时仅凭文件
+    # 哈希会误判为「无变化」，导致后端永远补不齐。改为走全量重建路径。
+    if not force and _backend_data_missing(kb_name, index_dir):
+        logger.info("检测到 %s 的后端索引缺失或不完整，本次改为全量重建", kb_name)
+        force = True
 
     # 扫描支持格式的文档，按哈希判断哪些需要（重）摄入
     doc_files = sorted(
@@ -137,6 +155,7 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
             "docs": len(doc_files),
             "chunks": _count_chunks(index_dir),
             "vector": config.EMBEDDING_ENABLED,
+            "keyword": None,  # 未变更，本次没有写 ES
         }
 
     # 落盘原文：一次性重写（知识库规模小，全量重建比合并补丁简单可靠）
@@ -159,6 +178,23 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
                 f"向量写入 Qdrant 失败，请确认向量库已启动（{config.QDRANT_URL}）: {e}"
             ) from e
 
+    # 关键词索引（可选）：写入 ES（见 ADR-008）
+    # ES 未启动时不中断摄入——进程内 rank_bm25 会兜底关键词路，只记告警；
+    # 这与向量路不同：Qdrant 失败会中断（否则 chunk 与向量不一致），
+    # 而 ES 只是关键词路的加速实现，缺失时功能降级但不消失。
+    es_docs = 0
+    if config.ES_ENABLED:
+        try:
+            if force:
+                keyword_store.delete_kb(kb_name)
+            es_docs = keyword_store.index_kb(kb_name, chunks)
+        except ElasticsearchUnavailable as e:
+            logger.warning(
+                "ES 关键词索引写入跳过（%s），关键词路将回退进程内 BM25: %s",
+                config.ES_URL,
+                e,
+            )
+
     # 早期版本把向量存为本地 vectors.npy，改用 Qdrant 后清理历史残留
     stale_vectors = index_dir / "vectors.npy"
     if stale_vectors.exists():
@@ -170,6 +206,10 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         "vector_store": "qdrant" if config.EMBEDDING_ENABLED else "",
         "qdrant_collection": config.QDRANT_COLLECTION if config.EMBEDDING_ENABLED else "",
         "embedding_model": config.EMBEDDING_MODEL if config.EMBEDDING_ENABLED else "",
+        # 关键词索引：写入成功记 elasticsearch，失败或未启用记本地 BM25 兜底
+        "keyword_store": "elasticsearch" if es_docs else "local-bm25",
+        "es_index": config.ES_INDEX if es_docs else "",
+        "es_docs": es_docs,
         "chunk_size": config.CHUNK_SIZE,
         "chunk_overlap": config.CHUNK_OVERLAP,
         "ingested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -182,6 +222,7 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         "docs": len(doc_files),
         "chunks": len(chunks),
         "vector": config.EMBEDDING_ENABLED,
+        "keyword": bool(es_docs),
     }
 
 
@@ -202,15 +243,54 @@ def _count_chunks(index_dir: Path) -> int:
         return sum(1 for _ in f)
 
 
+def _backend_data_missing(kb_name: str, index_dir: Path) -> bool:
+    """
+    校验向量库 / ES 中该知识库的数据量是否与本地原文索引一致
+
+    任一后端数量对不上即返回 True（调用方转全量重建）。
+    后端不可达时不做判定——「服务没启动」不等于「数据丢了」，
+    那种情况由检索层的降级链处理，不该触发一次昂贵的重建。
+    """
+    expected = _count_chunks(index_dir)
+    if expected == 0:
+        return False  # 尚未摄入过，走正常流程即可
+
+    if config.EMBEDDING_ENABLED:
+        try:
+            if vector_store.count(kb_name) != expected:
+                return True
+        except QdrantUnavailable:
+            pass
+
+    if config.ES_ENABLED:
+        try:
+            if keyword_store.count(kb_name) != expected:
+                return True
+        except ElasticsearchUnavailable:
+            pass
+
+    return False
+
+
 if __name__ == "__main__":
     # 命令行入口：python -m app.rag.ingest [--force]
     import sys
 
+    # 让摄入过程中的告警（如同步 ES 失败）能在命令行看到
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
     results = ingest_all(force="--force" in sys.argv)
     for item in results:
         status = "已更新" if item["updated"] else "无变化"
-        vector_status = "向量(Qdrant)+BM25" if item["vector"] else "纯 BM25"
+        keyword = item.get("keyword")
+        if keyword is None:
+            keyword_status = "未变更"
+        elif keyword:
+            keyword_status = f"已索引({config.ES_INDEX})"
+        else:
+            keyword_status = "回退本地 rank-bm25"
+        vector_status = "已索引" if item["vector"] else "未启用"
         print(
-            f"[{item['kb']}] {status} | 文档 {item['docs']} 份 | "
-            f"chunk {item['chunks']} 条 | 检索模式: {vector_status}"
+            f"[{item['kb']}] {status} | 文档 {item['docs']} 份 | chunk {item['chunks']} 条\n"
+            f"    关键词路(ES): {keyword_status} | 向量路(Qdrant): {vector_status}"
         )

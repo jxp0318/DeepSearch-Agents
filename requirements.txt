@@ -34,10 +34,12 @@ requests>=2.31.0            # HTTP 请求库
 
 # --- 自建 RAG (Knowledge Base Retrieval) ---
 numpy>=1.26.0               # 向量矩阵与相似度计算
-jieba>=0.42.1               # 中文分词（BM25 检索的分词器）
-rank-bm25>=0.2.2            # Okapi BM25 关键词检索
+jieba>=0.42.1               # 中文分词（进程内 BM25 兜底实现的分词器）
+rank-bm25>=0.2.2            # Okapi BM25 进程内实现：ES 不可达时兜底关键词路
 qdrant-client>=1.14,<1.17    # Qdrant 向量库客户端；版本需与 docker-compose 中的
                             # qdrant/qdrant:v1.16 服务端匹配，避免兼容性警告
+elasticsearch>=8,<9         # ES 客户端（关键词检索路，见 ADR-008）；版本需与服务端
+                            # elasticsearch:8.19 匹配
 
 # --- 基础工具 (Utilities) ---
 PyYAML>=6.0                 # YAML 配置文件解析，用于 prompts.py

@@ -1,9 +1,10 @@
 """
 自建 RAG 配置模块
 
-集中管理知识库根目录、索引存储目录、embedding 端点与向量库（Qdrant）配置。
-embedding 与向量库都是可插拔的：未配置 EMBEDDING_* 或 Qdrant 不可达时，
-检索自动降级为纯 BM25，系统保持可用。
+集中管理知识库根目录、索引存储目录、embedding 端点、向量库（Qdrant）与
+关键词库（Elasticsearch）配置。
+embedding / Qdrant / ES 都是可插拔的：未配置 EMBEDDING_*、Qdrant 不可达或
+ES 不可达时，检索按 ADR-006 / ADR-007 / ADR-008 的降级链回退，系统保持可用。
 （本项目 LLM 端点没有 /v1/embeddings，实测 404，故 embedding 必须独立配置。）
 """
 
@@ -46,8 +47,13 @@ EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "")
 EMBEDDING_ENABLED = bool(EMBEDDING_BASE_URL and EMBEDDING_API_KEY and EMBEDDING_MODEL)
 
-# 每次 embedding 请求的最大文本条数：分批调用，避免单请求过大被网关拒绝
-EMBEDDING_BATCH_SIZE = 16
+# 每次 embedding 请求的最大文本条数：分批调用，避免单请求过大被网关拒绝。
+# CPU 推理下批越小单请求越快——8 条是本机实测的折中（16 条时单批会顶到超时线）
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "8"))
+
+# 单次 embedding 请求超时（秒）：CPU 推理本身较慢，加上开发机可能存在 HTTP 代理，
+# 批请求耗时波动大，30 秒会误判超时导致摄入半途失败（实测踩到过）
+EMBEDDING_TIMEOUT = float(os.getenv("EMBEDDING_TIMEOUT", "120"))
 
 # 向量库（Qdrant）：见 ADR-007
 # 只负责 chunk 向量的持久化与相似度检索；原文仍保存在本地 chunks.jsonl（BM25 路依赖它），
@@ -59,6 +65,20 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "deepsearch_kb")
 # 连接与查询超时（秒）：向量库不可达时快速失败并降级，不让检索卡住
 QDRANT_TIMEOUT = float(os.getenv("QDRANT_TIMEOUT", "5"))
+
+# 关键词检索（Elasticsearch）：见 ADR-008
+# 承接双路检索里的「关键词路」——IK 中文分词 + 倒排索引 + BM25 打分（ES 7 起默认打分器）。
+# 与 Qdrant 对称：单索引 + kb 字段过滤，seq 与 chunks.jsonl 行号对齐。
+# ES 不可达时检索层回退到进程内的 rank_bm25 实现，知识库能力不消失（三级降级）。
+ES_URL = os.getenv("ES_URL", "http://localhost:9200").rstrip("/")
+ES_USERNAME = os.getenv("ES_USERNAME", "")
+ES_PASSWORD = os.getenv("ES_PASSWORD", "")
+# 单索引 + kb 字段过滤（与 Qdrant 的建模方式保持一致）
+ES_INDEX = os.getenv("ES_INDEX", "deepsearch_kb")
+# 连接与查询超时（秒）：ES 不可达时快速失败并回退本地 BM25
+ES_TIMEOUT = float(os.getenv("ES_TIMEOUT", "5"))
+# 是否启用 ES 关键词路：置 0 可强制走进程内 rank_bm25（离线演示 / 评测对照用）
+ES_ENABLED = os.getenv("ES_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 
 
 def list_knowledge_base_names() -> list[str]:
