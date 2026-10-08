@@ -1,9 +1,11 @@
 """
-主智能体组装与异步执行模块
+主智能体组装与反思循环执行模块
 
 负责把模型、主提示词、文件类工具和三个专家子智能体组装成 DeepAgent，
-并提供 run_deep_agent 作为后续 API 层调用的统一入口。运行时还会为每个
-session_id 创建独立工作目录，并把工具调用、子智能体调用和最终结果推送给前端。
+并在其外层实现反思循环：每轮执行后由评估器判断信息是否充分，不充分则
+识别缺口并驱动下一轮补充检索，直到充分、轮数耗尽或 token 预算用尽。
+
+设计决策见 docs/design.md ADR-001（外层循环不改框架）与 ADR-003（事件语义分离）。
 """
 
 import asyncio
@@ -15,6 +17,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
+from app.agent.reflection import (
+    build_supplement_message,
+    evaluate_sufficiency,
+    get_reflection_config,
+)
 from app.agent.subagents.database_query_agent import database_query_agent
 from app.agent.subagents.knowledge_base_agent import knowledge_base_agent
 from app.agent.subagents.network_search_agent import network_search_agent
@@ -46,12 +53,77 @@ main_agent = create_deep_agent(
 project_root_path = Path(__file__).parents[1].resolve()
 
 
+async def _run_agent_round(message: str, config: dict) -> tuple[str, int]:
+    """
+    执行一轮主智能体（单次图执行）
+
+    复用同一 thread_id 的 checkpointer，因此后续轮次可以直接看到前面所有轮次的
+    消息上下文，无需手动拼接历史。
+
+    :param message: 本轮注入主智能体的消息（首轮为任务+工作环境指令，后续轮为补搜指令）
+    :param config: LangGraph 运行配置，含 thread_id
+    :return: (本轮最终回答文本, 本轮累计 token 数)
+    """
+    round_result = ""
+    round_tokens = 0
+    has_usage = False
+
+    # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
+    async for chunk in main_agent.astream(
+        {"messages": [{"role": "user", "content": message}]},
+        config=config,
+    ):
+        # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
+        for node_name, state in chunk.items():
+            if not state or "messages" not in state:
+                continue
+            messages = state["messages"]
+            if not (messages and isinstance(messages, list)):
+                continue
+
+            last_msg = messages[-1]
+
+            # token 消耗取自模型消息的 usage_metadata，作为反思循环预算的计量依据
+            usage = getattr(last_msg, "usage_metadata", None)
+            if usage and isinstance(usage, dict):
+                has_usage = True
+                round_tokens += int(usage.get("total_tokens") or 0)
+
+            if node_name != "model":
+                continue
+
+            if last_msg.tool_calls:
+                # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
+                for tool_call in last_msg.tool_calls:
+                    if tool_call["name"] == "task":
+                        # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
+                        monitor.report_assistant(
+                            tool_call["args"]["subagent_type"],
+                            {"description": tool_call["args"]["description"]},
+                        )
+            elif last_msg.content:
+                # 模型本轮不再调用工具时，这段文本就是本轮的最终回答。
+                # 中间过程性文本会被后续更完整的回答覆盖，只保留最后一次。
+                round_result = (
+                    last_msg.content
+                    if isinstance(last_msg.content, str)
+                    else str(last_msg.content)
+                )
+
+    # 模型接口未返回 usage_metadata 时，按字符数粗估 token，保证预算约束仍然生效
+    if not has_usage and round_result:
+        round_tokens = max(1, len(round_result) // 2)
+
+    return round_result, round_tokens
+
+
 async def run_deep_agent(task_query, session_id):
     """
-    异步流式执行主智能体
+    执行主智能体反思循环（API 层统一入口）
 
-    API 层会为每次任务传入用户问题和 session_id。本函数负责准备会话目录、
-    复制上传文件、写入 ContextVar，并在流式执行过程中把关键事件上报给前端。
+    流程：准备会话目录 → 首轮执行 → 评估充分性 → 不充分则补搜迭代 → 输出最终结果。
+    每轮的关键事件都通过 monitor 推送到前端，形成「搜 → 反思 → 补搜」的可视化链路。
+
     :param task_query: 前端提交的原始任务问题
     :param session_id: 当前任务 ID，同时用于 thread_id、输出目录和 WebSocket 定向推送
     """
@@ -89,10 +161,14 @@ async def run_deep_agent(task_query, session_id):
     session_dir_token = set_session_context(session_dir_str)
     session_id_token = set_thread_context(session_id)
 
-    # 前端拿到工作目录后，可以展示本次任务生成的 Markdown/PDF 等产物
-    monitor.report_session_dir(session_dir_str)
+    # 新任务开始：清空该 thread 的历史事件缓冲，避免回放上一轮任务的轨迹
+    monitor.begin_task()
 
-    # checkpointer 依赖 thread_id 区分会话记忆；同一 session_id 会复用同一条执行上下文
+    # 前端拿到工作目录后，可以展示本次任务生成的 Markdown/PDF 等产物
+    # 同时带上原始问题：页面刷新或跨标签页收到事件时，前端能还原用户提问
+    monitor.report_session_dir(session_dir_str, task_query)
+
+    # checkpointer 依赖 thread_id 区分会话记忆；同一 session_id 的多轮反思共用一条上下文
     config = {"configurable": {"thread_id": session_id}}
 
     # 工作环境指令是运行时动态补充的，约束模型只在当前会话目录读写文件
@@ -108,54 +184,101 @@ async def run_deep_agent(task_query, session_id):
     4. 若存在上传文件，请先分析内容
     """
 
+    reflection_config = get_reflection_config()
+    max_rounds = reflection_config["max_rounds"]
+    token_budget = reflection_config["token_budget"]
+
+    current_message = task_query + path_instruction
+    final_result = ""
+    total_tokens = 0
+
     try:
-        # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
-        async for chunk in main_agent.astream(
-            {"messages": [{"role": "user", "content": task_query + path_instruction}]},
-            config=config,
-        ):
-            # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
-            for node_name, state in chunk.items():
-                if not state or "messages" not in state:
-                    continue
-                messages = state["messages"]
-                if messages and isinstance(messages, list):
-                    last_msg = messages[-1]
-                    if node_name == "model":
-                        if last_msg.tool_calls:
-                            # DeepAgents 调用子智能体时，本质上会产生名为 task 的工具调用
-                            for tool_call in last_msg.tool_calls:
-                                if tool_call["name"] == "task":
-                                    # 子智能体调用单独上报，前端可以展示“正在调用哪个专家助手”
-                                    monitor.report_assistant(
-                                        tool_call["args"]["subagent_type"],
-                                        {
-                                            "description": tool_call["args"][
-                                                "description"
-                                            ]
-                                        },
-                                    )
-                        elif last_msg.content:
-                            # 模型没有继续调用工具时，最新文本内容就是本轮可反馈给前端的结果
-                            print(
-                                f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
-                            )
-                            monitor.report_task_result(last_msg.content)
+        for round_num in range(1, max_rounds + 1):
+            print(f"[MainAgent] 第 {round_num}/{max_rounds} 轮执行开始")
+            round_result, round_tokens = await _run_agent_round(current_message, config)
+            total_tokens += round_tokens
+
+            if round_result:
+                final_result = round_result
+            else:
+                # 本轮没有产出文本：保留上一轮结果，避免反思循环把已有结论清空
+                monitor.report_reflection_stopped(
+                    "本轮未产出回答",
+                    f"第 {round_num} 轮为空，沿用上一轮结果",
+                )
+
+            # 最后一轮不再触发评估，直接终止循环
+            if round_num >= max_rounds:
+                monitor.report_round_result(
+                    round_num, final_result, stop_reason="达到最大轮数"
+                )
+                break
+
+            # 反思评估：判断当前信息是否足以回答用户问题
+            evaluation = evaluate_sufficiency(task_query, final_result)
+            monitor.report_reflection_evaluation(round_num, evaluation)
+
+            if evaluation.sufficient:
+                monitor.report_round_result(round_num, final_result, stop_reason="信息充分")
+                break
+
+            # 预算兜底：评估判定不充分但已超 token 预算时，停止迭代，输出当前最好结果
+            if total_tokens >= token_budget:
+                monitor.report_reflection_stopped(
+                    "token 预算耗尽",
+                    f"已消耗 {total_tokens} tokens，预算 {token_budget}",
+                )
+                monitor.report_round_result(
+                    round_num, final_result, stop_reason="预算耗尽"
+                )
+                break
+
+            # 缺口为空说明无法生成可执行的补充查询，继续迭代只会空转
+            if not evaluation.missing_dimensions and not evaluation.follow_up_queries:
+                monitor.report_reflection_stopped(
+                    "无明确信息缺口", "评估未给出可执行的补充方向"
+                )
+                monitor.report_round_result(
+                    round_num, final_result, stop_reason="无补充方向"
+                )
+                break
+
+            # 生成下一轮补搜指令（复用同一 thread_id，模型自带全部历史上下文）
+            monitor.report_reflection_supplement(
+                round_num + 1, evaluation.follow_up_queries
+            )
+            current_message = build_supplement_message(evaluation, round_num + 1)
+            print(
+                f"[MainAgent] 第 {round_num} 轮反思发现缺口，进入第 {round_num + 1} 轮补搜"
+            )
+
+        print(f"[MainAgent] 反思循环结束，累计消耗 token 约 {total_tokens}")
+        monitor.report_task_result(final_result)
 
     except asyncio.CancelledError:
         monitor.report_task_cancelled()
         raise
     except Exception as e:
-        # 异步执行异常也走 monitor，保证前端能收到明确错误事件
-        monitor._emit("error", f"执行主智能发生异常信息：{str(e)}")
+        # 异常兜底：把错误类型和原因一起告诉前端，避免只看到一串栈信息
+        error_type = type(e).__name__
+        detail = str(e) or "未提供更多信息"
+        print(f"[MainAgent] 任务执行中断（{error_type}）：{detail}")
+
+        monitor.report_error(
+            reason=error_type,
+            detail=detail,
+            has_partial_result=bool(final_result),
+        )
+
+        # 已经产出过内容时按「部分结果」交付：网络抖动不该让整轮研搜成果作废
+        if final_result:
+            monitor.report_task_result(final_result, partial=True)
     finally:
         # 任务结束后恢复 ContextVar，避免后续请求复用到本次会话目录或 thread_id
         reset_session_context(session_dir_token, session_id_token)
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(
         run_deep_agent("从网络查询机器人信息，并生成Markdown文件", "test_session_001")
     )
