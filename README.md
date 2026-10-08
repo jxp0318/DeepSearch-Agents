@@ -94,6 +94,12 @@ uv sync
 
 该命令会根据 `pyproject.toml` 和 `uv.lock` 创建虚拟环境并安装依赖。
 
+> 依赖声明与版本锁定**只维护这一份**（项目中没有 `requirements.txt`）。如需交付给只认 requirements.txt 的环境，按需导出即可，不要手工维护第二份：
+>
+> ```bash
+> uv export --format requirements-txt --no-hashes > requirements.txt
+> ```
+
 ### 3. 安装前端依赖
 
 ```bash
