@@ -3,7 +3,7 @@
 > 目标：为 deepsearch-agents 建立一套可复现的评测集与判分协议，产出「反思循环前后对比」的量化数字。
 > 核心认知：**deep research 系统的输出是研究报告，不是短答案**——不能用「标准答案精确匹配」的思路建评测集，必须用「关键事实命中 + 过程指标」的组合判分。
 >
-> 备注：知识库类任务当前跑在自建 RAG（BM25-only 基线）之上（ADR-006）。配置 embedding 端点后可复用同一评测集跑出「纯 BM25 vs 双路融合」的检索质量对比——这是免费的第二组对比数据。
+> 备注：知识库类任务运行在自建 RAG 之上（ADR-006），当前 embedding / Qdrant / Elasticsearch 均已接入。可用同一评测集跑出「进程内 BM25 vs ES 关键词 vs 向量 vs RRF 融合」四模式的检索质量对比（`python -m scripts.compare_retrieval`）——这是免费的第二组对比数据。
 
 ---
 
@@ -75,9 +75,9 @@ judge 用 `with_structured_output(..., method="json_mode")`——沿用 ADR-002 
 | 端到端延迟 | 提交到 task_result 的墙钟时间 | monitor 时间戳 |
 | 路由准确率 | 实际信源 ⊇ expected_sources 的任务比例 | 工具调用序列 |
 
-**反思触发率是本项目特有的指标**——它直接回答面试问题「你怎么知道反思循环真的在干活」。
+**反思触发率是本项目特有的指标**——它直接回答「反思循环是否真的在起作用」这个问题。
 
-## 4. 对比实验协议（简历数字的来源）
+## 4. 对比实验协议
 
 ```text
 配置 A（等效关闭反思）：REFLECTION_MAX_ROUNDS = 1，其余不变
@@ -93,7 +93,7 @@ judge 用 `with_structured_output(..., method="json_mode")`——沿用 ADR-002 
 
 | 指标 | 配置 A（无反思） | 配置 B（反思） | 变化 |
 |------|------|------|------|
-| 任务成功率 | 待测 | 待测 | 目标：简历上「A% → B%」 |
+| 任务成功率 | 待测 | 待测 | 目标：量化「A% → B%」的提升 |
 
 分 category 的细分表 + 归因分析（哪类任务提升最大、失败案例的失败原因分类）。
 
@@ -111,7 +111,7 @@ judge 用 `with_structured_output(..., method="json_mode")`——沿用 ADR-002 
 
 - 按单任务平均 40k token 估算：120 次 ≈ 480 万 token；若成本敏感，可将 easy 题重复次数降为 2 次
 - Tavily 间歇性故障已由分层重试兜底（ADR-005），但评测跑批仍建议避开网络高峰、失败任务单独补跑并记录
-- 评测期间 `docker start deepsearch-mysql`（DB 类任务硬依赖）；RAGFlow 服务需在线
+- 评测期间 `docker start deepsearch-mysql`（DB 类任务硬依赖）；知识库类任务需 embedding / Qdrant / Elasticsearch 服务在线
 - 判分模型与被测模型同源，存在自评偏向——如实写入 eval 报告的方法论一节，有条件时换 judge 模型交叉抽检
 
 ## 7. 结果记录（评测完成后回填）
