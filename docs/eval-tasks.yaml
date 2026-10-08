@@ -1,0 +1,226 @@
+# deepsearch-agents 评测集 v0（20 条，待首跑校准）
+# 依据 docs/eval.md 第 5 节校准流程：DB 类 gold_facts 基于表结构推断，
+# 首跑时必须对照库内真实数据修正；KB 类对照 PDF 原文核对；web 类核对事实锚点当前可搜。
+
+# ========== 数据库类（5 条，信源：deepsearch_db 制药业务库）==========
+
+- id: db-01
+  category: database
+  difficulty: easy
+  query: 布洛芬缓释胶囊的商品名和规格是什么？
+  expected_sources: [mysql]
+  must_reflect: false
+  gold_facts:
+    - "商品名（brand_name 字段值）"
+    - "规格（specifications 字段值，如 0.3g*24粒/盒 形态）"
+  gold_answer: null  # 校准时从 drugs 表实测回填
+
+- id: db-02
+  category: database
+  difficulty: medium
+  query: 心血管治疗领域有哪些药品？按药品列出各自的当前库存总量。
+  expected_sources: [mysql]
+  must_reflect: false
+  gold_facts:
+    - "心血管领域药品清单（治疗领域字段匹配）"
+    - "每个药品的库存总量（inventory.quantity_on_hand 按 drug_id 聚合）"
+
+- id: db-03
+  category: database
+  difficulty: medium
+  query: 销售额最高的三种药品是哪些？各自的销售额和销售数量是多少？
+  expected_sources: [mysql]
+  must_reflect: false
+  gold_facts:
+    - "销售额 TOP3 药品名称"
+    - "对应 total_amount 与 quantity_sold 数值"
+  gold_answer: null  # 校准时以 SUM/ORDER BY 实测回填
+
+- id: db-04
+  category: database
+  difficulty: hard
+  query: 哪些药品的库存批次将在未来 6 个月内过期？列出药品名称、仓库位置和对应治疗领域。
+  expected_sources: [mysql]
+  must_reflect: false
+  gold_facts:
+    - "过期批次药品清单（expiry_date 日期条件过滤）"
+    - "仓库位置（warehouse_location）"
+    - "治疗领域（关联 drugs 表）"
+  note: 考察多表 join + 日期计算；若库内无 6 个月内到期批次，校准时放宽窗口
+
+- id: db-05
+  category: database
+  difficulty: hard
+  query: 按销售区域统计各治疗领域的销售额，找出销售额最高的区域-治疗领域组合，并说明该区域的主要客户有哪些。
+  expected_sources: [mysql]
+  must_reflect: false
+  gold_facts:
+    - "区域 × 治疗领域聚合结果"
+    - "最优组合的具体区域与领域名"
+    - "该区域主要客户（customer_name）"
+
+# ========== 知识库类（5 条，信源：RAGFlow，电商/金融 5 份 PDF）==========
+
+- id: kb-01
+  category: knowledge_base
+  difficulty: easy
+  query: 2026 数字人电商直播白皮书中，数字人直播主要应用于哪些电商场景？
+  expected_sources: [ragflow]
+  must_reflect: false
+  gold_facts:
+    - "白皮书列出的主要应用场景清单（校准时对照原文）"
+
+- id: kb-02
+  category: knowledge_base
+  difficulty: medium
+  query: 贝莱德 2026 年全球投资展望对全球股票市场的核心观点是什么？给出了哪些大类资产配置建议？
+  expected_sources: [ragflow]
+  must_reflect: false
+  gold_facts:
+    - "对股票市场的核心判断"
+    - "具体配置建议（增持/减持方向）"
+
+- id: kb-03
+  category: knowledge_base
+  difficulty: medium
+  query: 长江商学院 2025 年四季度投资者情绪调查中，投资者对 A 股的预期如何？与对其他资产的预期相比有什么差异？
+  expected_sources: [ragflow]
+  must_reflect: false
+  gold_facts:
+    - "对 A 股预期的关键调查结论"
+    - "与其他资产预期的对比"
+
+- id: kb-04
+  category: knowledge_base
+  difficulty: hard
+  query: 中国人民银行 2025 年第四季度货币政策执行报告中，对下一阶段货币政策的基调是什么？报告认为当前经济运行中的主要问题有哪些？
+  expected_sources: [ragflow]
+  must_reflect: false
+  gold_facts:
+    - "货币政策基调表述"
+    - "报告指出的主要经济问题清单"
+  note: 63 页长文档，考察检索命中与长上下文综合
+
+- id: kb-05
+  category: knowledge_base
+  difficulty: hard
+  query: 对比电商行业 AI 应用研究报告与数字人电商直播白皮书，两份报告对 AI 在电商中的应用趋势有哪些共同判断？各自独有的观点是什么？
+  expected_sources: [ragflow]
+  must_reflect: true   # 跨文档对比，单轮检索大概率只命中一份
+  gold_facts:
+    - "两份报告的共同判断（至少 2 条）"
+    - "各自独有观点（至少各 1 条）"
+
+# ========== 网络类（5 条，信源：Tavily；答案可能漂移，判分看来源支撑）==========
+
+- id: web-01
+  category: web
+  difficulty: easy
+  query: 2026 年诺贝尔物理学奖得主是谁？获奖原因是什么？
+  expected_sources: [tavily]
+  must_reflect: false
+  gold_facts:
+    - "得主姓名"
+    - "获奖成果描述"
+  note: 10 月初刚公布，搜索时效性好；若已过时效（答案广为人知），校准时换题
+
+- id: web-02
+  category: web
+  difficulty: medium
+  query: LangGraph 目前最新的稳定版本是什么？这个版本有哪些主要特性？
+  expected_sources: [tavily]
+  must_reflect: false
+  gold_facts:
+    - "版本号（锚定 GitHub releases）"
+    - "主要特性描述"
+  note: 版本随时间漂移，judge 只核报告论断与引用来源一致
+
+- id: web-03
+  category: web
+  difficulty: medium
+  query: Tavily 搜索 API 目前提供哪些主要功能？免费额度和定价如何？
+  expected_sources: [tavily]
+  must_reflect: false
+  gold_facts:
+    - "主要功能清单"
+    - "定价/额度的大致量级"
+  note: 项目自身依赖的服务，面试聊到评测时能自圆其说
+
+- id: web-04
+  category: web
+  difficulty: hard
+  query: 目前主流的开源 Deep Research 项目有哪些？对比它们的架构方案和主要差异。
+  expected_sources: [tavily]
+  must_reflect: true   # 需要 3+ 次针对性搜索才能横向对比
+  gold_facts:
+    - "至少 3 个项目名称"
+    - "架构层面的差异点（编排方式/反思机制/信源）"
+  note: 与本项目直接相关的领域情报，答案本身对后续迭代有用
+
+- id: web-05
+  category: web
+  difficulty: hard
+  query: 2026 年以来中国新能源汽车市场最新的销量数据和市场趋势如何？头部厂商格局有什么变化？
+  expected_sources: [tavily]
+  must_reflect: true   # 数据 + 趋势 + 格局三个维度，单轮难覆盖
+  gold_facts:
+    - "销量数据（量级与同比）"
+    - "头部厂商格局描述"
+    - "趋势判断有数据来源支撑"
+
+# ========== 混合类（5 条，多信源综合，反思循环的主战场）==========
+
+- id: mix-01
+  category: mixed
+  difficulty: medium
+  query: 公司库存中解热镇痛类药品的库存情况如何？结合近期市场信息，这类药品当前是否需要补货？
+  expected_sources: [mysql, tavily]
+  must_reflect: true   # 库存查询 + 市场信息两步，天然需要补搜
+  gold_facts:
+    - "解热镇痛类药品库存数据（来自 DB）"
+    - "市场层面的判断（来自网络且有来源）"
+    - "明确的补货建议及依据"
+
+- id: mix-02
+  category: mixed
+  difficulty: hard
+  query: 根据贝莱德 2026 年全球投资展望的观点，结合知识库中投资者情绪调查的数据，当前散户投资者的行为与机构建议之间存在哪些背离？
+  expected_sources: [ragflow]
+  must_reflect: true   # 两份金融文档交叉，单轮检索难同时命中
+  gold_facts:
+    - "贝莱德的核心建议"
+    - "情绪调查反映的散户行为"
+    - "至少 2 条具体的背离点"
+
+- id: mix-03
+  category: mixed
+  difficulty: hard
+  query: 知识库中电商 AI 应用报告提到的应用趋势，目前行业实际发展验证了哪些？给出最新的实际案例。
+  expected_sources: [ragflow, tavily]
+  must_reflect: true   # 先 KB 拿趋势，再网络找验证案例
+  gold_facts:
+    - "报告中的趋势清单（KB）"
+    - "至少 2 个验证案例（网络且有来源）"
+
+- id: mix-04
+  category: mixed
+  difficulty: hard
+  query: 糖尿病治疗领域的药品销售表现如何？结合该领域最新的行业动态，分析公司在这个治疗领域的市场机会。
+  expected_sources: [mysql, tavily]
+  must_reflect: true   # 销售数据 + 行业动态 + 综合分析三层
+  gold_facts:
+    - "糖尿病领域药品销售数据（来自 DB）"
+    - "行业动态（网络且有来源）"
+    - "市场机会分析建立在以上数据之上"
+
+- id: mix-05
+  category: mixed
+  difficulty: hard
+  query: 参考央行 2025 年四季度货币政策报告的基调，结合最新的宏观数据，当前货币环境下医药行业融资面临什么形势？
+  expected_sources: [ragflow, tavily]
+  must_reflect: true
+  gold_facts:
+    - "货币政策基调（KB）"
+    - "最新宏观数据（网络且有来源）"
+    - "对医药融资形势的推断有依据链"
+  note: KB(金融) + web + 行业推断，考察跨域综合，是最接近真实 deep research 的一题
