@@ -35,4 +35,5 @@ main_agent_content = prompt_yaml_content["main_agent"]
 # 子智能体配置集合，包含 name、description 和 system_prompt
 sub_agents_content = prompt_yaml_content["sub_agents"]
 
-print(sub_agents_content)
+# 反思循环配置：评估器提示词（判断信息是否充分、识别缺口维度）
+reflection_content = prompt_yaml_content["reflection"]
