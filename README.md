@@ -7,8 +7,10 @@ deepsearch-agents 是一个面向复杂研究任务的对话式多智能体系�
 ## 项目能力
 
 - 多智能体协作：主智能体负责分析、规划、调度和汇总，专业智能体分别处理网络搜索、数据库查询和知识库检索。
+- **反思循环**：每轮执行结束后由独立评估器判断信息是否足以回答原问题，不充分时识别缺口维度并驱动补充检索，最多迭代 3 轮（可通过环境变量调整），直到信息充分、轮数耗尽或 token 预算用尽。
 - 多来源研究：支持结合公开资料、结构化业务数据、私有知识库和本地上传文件完成综合分析。
-- 实时过程展示：后端通过 WebSocket 推送任务状态、智能体调用、工具调用、结果和异常信息。
+- 实时过程展示：后端通过 WebSocket 推送任务状态、智能体调用、工具调用、反思评估、结果和异常信息。
+- **网络调用容错**：搜索等外部调用带「连接池重试 + 指数退避」，且失败时降级为可读错误交回模型决策（可换词重搜或改用其他信息源），不会因一次网络抖动作废整轮研搜；任务中途异常时保留已产出的部分结果并明确标注不完整。
 - 文件输入与输出：支持读取常见办公文档和文本文件，并生成 Markdown 或 PDF 报告。
 - 会话隔离：每次任务使用独立会话标识和输出目录，避免不同任务之间的数据相互干扰。
 - 前后端分离：后端使用 FastAPI，前端使用 React、TypeScript、Vite 和 Ant Design。
@@ -24,9 +26,15 @@ FastAPI 创建独立会话
         ↓
 调度网络搜索、数据库查询或 RAGFlow 知识库智能体
         ↓
-汇总多来源信息并生成最终结果
+汇总多来源信息，产出本轮结果
         ↓
-通过 WebSocket 向前端推送进度和文件
+反思评估器：信息是否足以回答问题？
+   ├─ 充分 / 达到轮数上限 / token 预算耗尽 → 输出最终结果
+   └─ 不充分 → 识别缺口维度，生成补充查询
+              ↓
+        携缺口指令重新进入主循环（复用同一会话上下文）
+        ↓
+通过 WebSocket 向前端推送执行轨迹、反思过程和生成文件
 ```
 
 ## 项目结构
@@ -34,7 +42,7 @@ FastAPI 创建独立会话
 ```text
 deepsearch-agents/
 ├─ app/
-│  ├─ agent/              智能体配置、提示词和调度逻辑
+│  ├─ agent/              智能体配置、提示词、调度逻辑与反思循环
 │  ├─ api/                FastAPI 接口与 WebSocket 服务
 │  ├─ prompt/             提示词配置
 │  ├─ ragflow/            RAGFlow 配置与调用示例
@@ -119,6 +127,15 @@ LLM_QWEN_MAX=模型名称
 # 网络搜索
 TAVILY_API_KEY=你的_TAVILY_API_KEY
 
+# 网络搜索容错（可选，留空使用默认值）
+TAVILY_TIMEOUT=30
+TAVILY_TRANSPORT_RETRIES=3
+TAVILY_MAX_ATTEMPTS=2
+TAVILY_BACKOFF_BASE=0.8
+# 需要代理访问 Tavily 时才设置
+# TAVILY_HTTP_PROXY=http://127.0.0.1:7890
+# TAVILY_HTTPS_PROXY=http://127.0.0.1:7890
+
 # RAGFlow
 RAGFLOW_API_URL=你的_RAGFlow_服务地址
 RAGFLOW_API_KEY=你的_RAGFlow_API_KEY
@@ -132,6 +149,10 @@ MYSQL_PORT=3307
 MYSQL_CHARSET=utf8mb4
 MYSQL_COLLATION=utf8mb4_unicode_ci
 MYSQL_SQL_MODE=TRADITIONAL
+
+# 反思循环（可选，留空使用默认值）
+REFLECTION_MAX_ROUNDS=3
+REFLECTION_TOKEN_BUDGET=150000
 ```
 
 至少需要正确配置大模型接口和密钥。未配置 Tavily、MySQL 或 RAGFlow 时，对应的网络搜索、数据库查询或知识库能力将不可用。
