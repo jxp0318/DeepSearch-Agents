@@ -1,5 +1,6 @@
 import {
   ApiOutlined,
+  ArrowDownOutlined,
   BranchesOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
@@ -39,18 +40,51 @@ function createTurn(content: string): ChatTurn {
   };
 }
 
+// 判定“用户是否停留在底部”的容差：滚动位置距底部小于该值视为跟随中
+const STICK_TO_BOTTOM_THRESHOLD = 80;
+
 export default function App() {
   const { message } = AntApp.useApp();
   const [query, setQuery] = useState("");
   const [stagedItems, setStagedItems] = useState<UploadedItem[]>([]);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [isFollowingLatest, setIsFollowingLatest] = useState(true);
   const streamRef = useRef<HTMLElement | null>(null);
+  // 用 ref 镜像跟随状态，供滚动副作用同步读取，避免闭包读到旧值
+  const followingRef = useRef(true);
   const session = useDeepAgentSession();
+
+  const setFollowing = (next: boolean) => {
+    if (followingRef.current === next) {
+      return;
+    }
+    followingRef.current = next;
+    setIsFollowingLatest(next);
+  };
+
+  const scrollToLatest = (behavior: ScrollBehavior = "smooth") => {
+    const streamNode = streamRef.current;
+    if (!streamNode) {
+      return;
+    }
+    streamNode.scrollTo({ top: streamNode.scrollHeight, behavior });
+  };
 
   useEffect(() => {
     setTurns((previous) => {
       if (previous.length === 0) {
-        return previous;
+        // 页面刷新、跨标签页或重连回放时会先收到事件、但本地还没有对应轮次，
+        // 这里按事件补建一条，避免「后端在跑、页面却一片空白」
+        if (session.events.length === 0) {
+          return previous;
+        }
+        return [
+          {
+            ...createTurn(session.currentQuery || "正在执行的任务"),
+            isRunning: session.isRunning,
+            result: session.result
+          }
+        ];
       }
 
       const latestTurn = previous[previous.length - 1];
@@ -64,20 +98,42 @@ export default function App() {
 
       return [...previous.slice(0, -1), nextLatestTurn];
     });
-  }, [session.events, session.files, session.isRunning, session.result]);
+  }, [
+    session.currentQuery,
+    session.events,
+    session.files,
+    session.isRunning,
+    session.result
+  ]);
 
+  // 监听流式区域滚动：用户主动往上翻超过阈值就停止自动跟随，回到底部附近再恢复
   useEffect(() => {
     const streamNode = streamRef.current;
     if (!streamNode) {
       return;
     }
 
-    window.requestAnimationFrame(() => {
-      streamNode.scrollTo({
-        top: streamNode.scrollHeight,
-        behavior: "smooth"
-      });
+    const handleScroll = () => {
+      const distance =
+        streamNode.scrollHeight - streamNode.scrollTop - streamNode.clientHeight;
+      setFollowing(distance <= STICK_TO_BOTTOM_THRESHOLD);
+    };
+
+    streamNode.addEventListener("scroll", handleScroll, { passive: true });
+    return () => streamNode.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  // 仅在“跟随中”才滚到底部：用户正在回看历史时不再打断
+  // behavior 用 auto：运行期间事件密集，smooth 会排成一串动画，产生被拽着下滑的粘滞感
+  useEffect(() => {
+    if (!followingRef.current) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollToLatest("auto");
     });
+    return () => window.cancelAnimationFrame(frame);
   }, [turns]);
 
   async function handleSubmit() {
@@ -90,6 +146,9 @@ export default function App() {
     const nextTurn = createTurn(cleanQuery);
     setTurns((previous) => [...previous, nextTurn]);
     setQuery("");
+    // 提交新任务时恢复自动跟随：用户此刻期望看到自己刚发出的问题
+    setFollowing(true);
+    window.requestAnimationFrame(() => scrollToLatest("smooth"));
 
     try {
       await session.submitTask(cleanQuery);
@@ -134,6 +193,7 @@ export default function App() {
     setTurns([]);
     setQuery("");
     setStagedItems([]);
+    setFollowing(true);
   }
 
   const online = session.connectionState === "connected";
@@ -233,6 +293,20 @@ export default function App() {
             turns={turns}
           />
         </section>
+
+        {!isFollowingLatest && turns.length > 0 ? (
+          <button
+            className="scroll-to-latest"
+            onClick={() => {
+              setFollowing(true);
+              scrollToLatest("smooth");
+            }}
+            type="button"
+          >
+            <ArrowDownOutlined aria-hidden />
+            回到最新
+          </button>
+        ) : null}
 
         <ChatComposer
           isCancelling={session.isCancelling}

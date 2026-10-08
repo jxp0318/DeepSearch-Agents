@@ -3,7 +3,12 @@ export type ConnectionState = "connecting" | "connected" | "reconnecting" | "clo
 export type MonitorEventName =
   | "session_created"
   | "tool_start"
+  | "tool_error"
   | "assistant_call"
+  | "round_result"
+  | "reflection_evaluation"
+  | "reflection_supplement"
+  | "reflection_stopped"
   | "task_result"
   | "task_cancelled"
   | "error"
@@ -15,6 +20,8 @@ export interface MonitorMessage {
   message: string;
   data: Record<string, unknown>;
   timestamp: string;
+  /** 后端按 thread 自增的事件序号，用于识别并跳过重连时回放的历史事件 */
+  seq?: number;
 }
 
 export interface PongMessage {

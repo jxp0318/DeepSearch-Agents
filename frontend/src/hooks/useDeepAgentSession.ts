@@ -11,6 +11,9 @@ import type {
 } from "../types";
 
 const MAX_EVENTS = 120;
+// 心跳间隔；超过 SILENCE_TIMEOUT 收不到任何消息（含 pong）就判定连接假死
+const HEARTBEAT_INTERVAL = 25000;
+const SILENCE_TIMEOUT = 70000;
 
 function extractString(data: Record<string, unknown>, key: string): string | null {
   const value = data[key];
@@ -22,6 +25,10 @@ export function useDeepAgentSession() {
   const reconnectTimerRef = useRef<number | undefined>(undefined);
   const heartbeatTimerRef = useRef<number | undefined>(undefined);
   const uploadedNameSetRef = useRef<Set<string>>(new Set());
+  // 已处理的最大事件序号：重连时后端会回放缓冲，靠它跳过已展示过的事件
+  const lastSeqRef = useRef(0);
+  // 最近一次收到任何服务端消息的时刻，用于检测假死连接
+  const lastMessageAtRef = useRef(Date.now());
   const [threadId, setThreadId] = useState(getStoredThreadId);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [events, setEvents] = useState<MonitorMessage[]>([]);
@@ -30,6 +37,8 @@ export function useDeepAgentSession() {
   const [result, setResult] = useState("");
   const [lastError, setLastError] = useState("");
   const [lastPongAt, setLastPongAt] = useState("");
+  // 当前正在执行（或最近一次执行）的任务问题，用于刷新页面后还原对话轮次
+  const [currentQuery, setCurrentQuery] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -55,8 +64,10 @@ export function useDeepAgentSession() {
     setSessionPath("");
     setResult("");
     setLastError("");
+    setCurrentQuery("");
     setUploadedItems([]);
     uploadedNameSetRef.current.clear();
+    lastSeqRef.current = 0;
     setIsRunning(false);
     setIsCancelling(false);
   }, []);
@@ -91,17 +102,26 @@ export function useDeepAgentSession() {
         }
         setConnectionState("connected");
         setLastError("");
+        lastMessageAtRef.current = Date.now();
         heartbeatTimerRef.current = window.setInterval(() => {
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.send("ping");
+          if (socket.readyState !== WebSocket.OPEN) {
+            return;
           }
-        }, 25000);
+          // 服务端会在收到 ping 后回 pong；长时间完全静默说明连接已假死，
+          // 主动关闭以触发 onclose 重连，否则页面会一直卡在“执行中”却收不到事件
+          if (Date.now() - lastMessageAtRef.current > SILENCE_TIMEOUT) {
+            socket.close();
+            return;
+          }
+          socket.send("ping");
+        }, HEARTBEAT_INTERVAL);
       };
 
       socket.onmessage = (event) => {
         if (socketRef.current !== socket) {
           return;
         }
+        lastMessageAtRef.current = Date.now();
         try {
           const payload = JSON.parse(event.data) as SocketMessage;
           if (payload.type === "pong") {
@@ -113,6 +133,14 @@ export function useDeepAgentSession() {
             return;
           }
 
+          // 建连时后端会回放缓冲事件，按序号去重，避免刷新/重连后轨迹重复
+          if (typeof payload.seq === "number") {
+            if (payload.seq <= lastSeqRef.current) {
+              return;
+            }
+            lastSeqRef.current = payload.seq;
+          }
+
           setEvents((previous) => [...previous, payload].slice(-MAX_EVENTS));
 
           if (payload.event === "session_created") {
@@ -120,6 +148,13 @@ export function useDeepAgentSession() {
             if (path) {
               setSessionPath(path);
             }
+            const query = extractString(payload.data, "query");
+            if (query) {
+              setCurrentQuery(query);
+            }
+            // 收到任务开始事件即进入运行态；刷新页面后靠回放也能还原该状态，
+            // 后续 task_result / error / task_cancelled 会把它复位
+            setIsRunning(true);
           }
 
           if (payload.event === "task_result") {
@@ -204,6 +239,9 @@ export function useDeepAgentSession() {
       setEvents([]);
       setResult("");
       setLastError("");
+      setCurrentQuery(cleanQuery);
+      // 新任务的事件序号从 1 重新开始，同步重置本地去重游标
+      lastSeqRef.current = 0;
       try {
         const response = await startTask(cleanQuery, threadId);
         if (response.thread_id && response.thread_id !== threadId) {
@@ -298,6 +336,7 @@ export function useDeepAgentSession() {
 
   return {
     connectionState,
+    currentQuery,
     events,
     files,
     isCancelling,

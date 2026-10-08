@@ -10,8 +10,12 @@ import {
   FilePdfOutlined,
   FileSearchOutlined,
   FileTextOutlined,
+  FlagOutlined,
+  SearchOutlined,
   StopOutlined,
+  SyncOutlined,
   ToolOutlined,
+  WarningOutlined,
 } from "@ant-design/icons";
 import { Button, Tooltip } from "antd";
 import { useEffect, useRef, useState } from "react";
@@ -69,6 +73,13 @@ const TASK_EXAMPLES = [
     prompt:
       "请使用 Markdown 文档生成工具和 Markdown 转 PDF 工具，基于本次调研结果生成一份 Markdown 报告，并转换成 PDF 保存到当前工作目录。",
     icon: <FileMarkdownOutlined aria-hidden />,
+  },
+  {
+    tool: "反思循环",
+    title: "多轮补搜研判",
+    prompt:
+      "综合网络公开信息、内部知识库和数据库数据，研判跨境电商 AI 客服领域的机会与风险，给出结论、依据和不确定性说明。",
+    icon: <SyncOutlined aria-hidden />,
   },
 ];
 
@@ -150,6 +161,9 @@ function EventIcon({ event }: { event: string }) {
   if (event === "tool_start") {
     return <ToolOutlined aria-hidden />;
   }
+  if (event === "tool_error") {
+    return <WarningOutlined aria-hidden />;
+  }
   if (event === "session_created") {
     return <FileSearchOutlined aria-hidden />;
   }
@@ -161,6 +175,18 @@ function EventIcon({ event }: { event: string }) {
   }
   if (event === "error") {
     return <CloseCircleOutlined aria-hidden />;
+  }
+  if (event === "reflection_evaluation") {
+    return <SyncOutlined aria-hidden />;
+  }
+  if (event === "reflection_supplement") {
+    return <SearchOutlined aria-hidden />;
+  }
+  if (event === "reflection_stopped") {
+    return <WarningOutlined aria-hidden />;
+  }
+  if (event === "round_result") {
+    return <FlagOutlined aria-hidden />;
   }
   return <ClockCircleOutlined aria-hidden />;
 }
@@ -177,6 +203,16 @@ function FileIcon({ name }: { name: string }) {
 
 function ThinkingTimeline({ events }: { events: MonitorMessage[] }) {
   const timelineRef = useRef<HTMLOListElement | null>(null);
+  // 时间线同样只在用户停留底部时跟随，避免回看执行轨迹时被拽走
+  const stickRef = useRef(true);
+
+  // 轮次计数以 round_result 为准（每轮结束时由后端发送一次）
+  const reflectionRounds = events.filter(
+    (event) => event.event === "round_result",
+  ).length;
+  const reflectionStopped = events.some(
+    (event) => event.event === "reflection_stopped",
+  );
 
   useEffect(() => {
     const timelineNode = timelineRef.current;
@@ -184,9 +220,20 @@ function ThinkingTimeline({ events }: { events: MonitorMessage[] }) {
       return;
     }
 
-    window.requestAnimationFrame(() => {
+    const handleScroll = () => {
+      const distance =
+        timelineNode.scrollHeight - timelineNode.scrollTop - timelineNode.clientHeight;
+      stickRef.current = distance <= 24;
+    };
+
+    timelineNode.addEventListener("scroll", handleScroll, { passive: true });
+
+    // 仅当用户仍停在底部时才跟随，回看历史轨迹时不打断
+    if (stickRef.current) {
       timelineNode.scrollTop = timelineNode.scrollHeight;
-    });
+    }
+
+    return () => timelineNode.removeEventListener("scroll", handleScroll);
   }, [events.length]);
 
   if (events.length === 0) {
@@ -217,12 +264,36 @@ function ThinkingTimeline({ events }: { events: MonitorMessage[] }) {
             </div>
             <p>{event.message}</p>
             {event.event === "assistant_call" ||
-            event.event === "tool_start" ? (
+            event.event === "tool_start" ||
+            event.event === "tool_error" ||
+            event.event === "reflection_evaluation" ||
+            event.event === "reflection_supplement" ||
+            event.event === "reflection_stopped" ? (
               <code>{JSON.stringify(event.data)}</code>
             ) : null}
           </div>
         </li>
       ))}
+      {reflectionRounds > 0 ? (
+        <li className="thinking-event thinking-event--reflection-summary">
+          <span className="thinking-event-icon">
+            <SyncOutlined aria-hidden />
+          </span>
+          <div>
+            <div className="thinking-event-meta">
+              <span>反思循环</span>
+              <strong>{reflectionRounds}</strong>
+            </div>
+            <p>
+              本次任务共执行 <strong>{reflectionRounds}</strong> 轮「执行 → 反思
+              → 补搜」，
+              {reflectionStopped
+                ? "循环因预算或轮数限制提前结束，输出当前最优结果。"
+                : "最后一轮评估判定信息已充分。"}
+            </p>
+          </div>
+        </li>
+      ) : null}
     </ol>
   );
 }
@@ -313,9 +384,18 @@ function AssistantMessage({
 
   const durationLabel = getThinkingDuration(events, timestamp, isRunning, now);
   const isCancelled = events.some((event) => event.event === "task_cancelled");
+  // 最后一次 task_result 被标记为 partial，说明任务中途异常终止、结果是半成品
+  const isPartial = (() => {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (events[index].event === "task_result") {
+        return events[index].data?.partial === true;
+      }
+    }
+    return false;
+  })();
   const syncLabel = isRunning
     ? `生成中 · 思考 ${durationLabel}`
-    : `${isCancelled ? "已取消" : "已同步"} · 用时 ${durationLabel}`;
+    : `${isCancelled ? "已取消" : isPartial ? "已中断" : "已同步"} · 用时 ${durationLabel}`;
 
   return (
     <article className="chat-message chat-message--assistant">
@@ -339,6 +419,15 @@ function AssistantMessage({
           </summary>
           <ThinkingTimeline events={events} />
         </details>
+
+        {isPartial ? (
+          <div className="assistant-partial-notice">
+            <WarningOutlined aria-hidden />
+            <span>
+              任务执行中断，以下为已产出的部分结果，信息可能不完整。可在时间线中查看中断原因。
+            </span>
+          </div>
+        ) : null}
 
         {result ? (
           <div className="assistant-answer">

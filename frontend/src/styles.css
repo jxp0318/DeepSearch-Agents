@@ -1817,3 +1817,66 @@ textarea {
     display: none;
   }
 }
+
+/* 回到底部按钮：与输入框同列居中，仅在用户回看历史（停止跟随）时出现 */
+.scroll-to-latest {
+  position: fixed;
+  left: calc(292px + (100vw - 292px) / 2);
+  bottom: 152px;
+  z-index: 11;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  background: rgba(10, 15, 23, 0.96);
+  color: var(--cyan);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transform: translateX(calc(min(900px, 100vw - 364px) / 2 - 100% - 8px));
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.scroll-to-latest:hover {
+  border-color: var(--cyan);
+  color: var(--text);
+}
+
+@media (max-width: 980px) {
+  .scroll-to-latest {
+    left: auto;
+    right: 26px;
+    bottom: 150px;
+    transform: none;
+  }
+}
+
+/* 工具调用失败：橙色区别于任务级错误（红色），提示本次工具未取到结果但任务仍在继续 */
+.thinking-event--tool_error .thinking-event-icon {
+  color: var(--amber);
+  border-color: rgba(255, 200, 87, 0.34);
+  background: rgba(255, 200, 87, 0.1);
+}
+
+/* 部分结果提示：任务中断但已产出内容时显示，避免把半成品当成完整交付 */
+.assistant-partial-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 200, 87, 0.32);
+  border-radius: 10px;
+  background: rgba(255, 200, 87, 0.08);
+  color: var(--amber);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.assistant-partial-notice > .anticon {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
