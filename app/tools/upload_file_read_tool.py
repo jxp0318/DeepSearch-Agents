@@ -6,6 +6,7 @@
 Word、PDF 和 Excel 等常见格式。
 """
 
+import tempfile
 from pathlib import Path
 from typing import Annotated
 
@@ -117,7 +118,7 @@ def read_file_content(
 if __name__ == "__main__":
     # 本地调试入口：直接运行本文件可验证 Markdown、PDF 等上传文件读取效果
     def get_session_context():
-        return "./examples/test_docs"
+        return str(Path(tempfile.gettempdir()) / "deepsearch_debug")
 
     md_path = "sub_dir/测试文件.md"
     pdf_path = "sub_dir/测试文件.pdf"

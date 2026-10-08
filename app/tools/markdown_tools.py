@@ -5,6 +5,7 @@ Markdown 文件生成工具
 filename/path 交给 resolve_path 统一解析，避免模型直接操作真实绝对路径。
 """
 
+import tempfile
 from pathlib import Path
 
 try:
@@ -73,7 +74,7 @@ def generate_markdown(
 if __name__ == "__main__":
     # 本地调试入口：直接运行本文件可验证 Markdown 写入和路径解析效果
     def get_session_context():
-        return "./examples/test_docs"
+        return str(Path(tempfile.gettempdir()) / "deepsearch_debug")
 
     test_content = "# 测试文档\n这是 Markdown 生成工具的本地测试内容"
     test_filename = "测试文件"
