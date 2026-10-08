@@ -28,7 +28,6 @@ tmp/
 
 # Local research materials and test uploads
 docs/knowledge_base/
-examples/test_docs/
 
 # IDE and operating-system files
 .idea/

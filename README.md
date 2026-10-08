@@ -53,7 +53,6 @@ deepsearch-agents/
 │  ├─ mysql/mysql.sql     MySQL 初始化数据
 │  └─ docker-compose.yaml MySQL 容器配置
 ├─ docs/                  项目文档和界面图片
-├─ examples/              独立功能示例
 ├─ frontend/              React 前端
 ├─ .env.example           后端环境变量示例
 ├─ pyproject.toml         Python 项目配置
