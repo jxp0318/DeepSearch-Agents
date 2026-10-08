@@ -1,12 +1,16 @@
 """
 知识库摄入模块
 
-流水线：扫描知识库目录 → 提取 → 切分 → embedding（可选）→ 持久化本地索引。
-索引按知识库落盘到 app/rag/indexes/<kb_name>/：
+流水线：扫描知识库目录 → 提取 → 切分 → embedding（可选）→ 写入向量库 + 落盘原文。
+索引按知识库组织，原文与向量分两处存储（见 ADR-007）：
 
-    chunks.jsonl   每个 chunk 一行 JSON（id / doc / heading / text）
-    vectors.npy    (N, dim) 的 float32 矩阵；embedding 未配置时不生成
-    meta.json      文件哈希清单与索引模式，用于增量摄入与降级标记
+    app/rag/indexes/<kb_name>/chunks.jsonl   每个 chunk 一行 JSON（id / doc / heading / text）
+    app/rag/indexes/<kb_name>/meta.json      文件哈希清单与索引模式，用于增量摄入与降级标记
+    Qdrant collection (payload.kb = <kb_name>)   chunk 向量 + 原文副本
+
+两条数据通过 chunk 在 chunks.jsonl 中的行号（seq）对齐：BM25 走本地原文，
+向量走 Qdrant，检索时在应用层做 RRF 融合。
+embedding 未配置时不写向量，检索退回纯 BM25。
 
 增量策略：按文件 sha256 跳过未变化的文档，只重摄入新增或修改的文件。
 """
@@ -20,6 +24,7 @@ import numpy as np
 
 from app.rag import config
 from app.rag.chunker import SUPPORTED_SUFFIXES, TextBlock, chunk_text, extract_document
+from app.rag.vector_store import QdrantUnavailable, vector_store
 
 
 def _file_sha256(file_path: Path) -> str:
@@ -41,6 +46,10 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
     :return: (N, dim) float32 矩阵
     """
     import requests
+
+    # 防御性裁剪：TEI 对超过模型 token 上限的输入直接返回 413 而不是截断，
+    # 这里按字符数上限先裁一刀，保证任何配置下都不会因单条过长中断整批摄入
+    texts = [t[: config.EMBEDDING_MAX_CHARS] for t in texts]
 
     headers = {"Authorization": f"Bearer {config.EMBEDDING_API_KEY}"}
     all_vectors: list[list[float]] = []
@@ -80,7 +89,7 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
 
 def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
     """
-    摄入单个知识库：提取 → 切分 → 向量化 → 落盘
+    摄入单个知识库：提取 → 切分 → 向量化 → 写向量库 + 落盘原文
 
     :param kb_name: 知识库目录名（KNOWLEDGE_BASE_ROOT 下的直接子目录）
     :param force: True 时忽略文件哈希全量重建索引
@@ -115,8 +124,9 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
             unchanged_files[rel_name] = file_hash
             continue
         blocks: list[TextBlock] = extract_document(doc_path)
-        for block in blocks:
-            chunks.extend(chunk_text(block, rel_name))
+        # block_index 参与 chunk id 构造，保证同标题的多个块之间 id 也不冲突
+        for block_index, block in enumerate(blocks, start=1):
+            chunks.extend(chunk_text(block, rel_name, block_index=block_index))
         unchanged_files[rel_name] = file_hash
 
     # 哈希全部一致且未强制重建：无需任何写入
@@ -129,23 +139,36 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
             "vector": config.EMBEDDING_ENABLED,
         }
 
-    # 落盘 chunks：一次性重写（知识库规模小，全量重建比合并补丁简单可靠）
+    # 落盘原文：一次性重写（知识库规模小，全量重建比合并补丁简单可靠）
+    # 这份文件是 BM25 路的唯一数据源，也是向量 payload 的 seq 对齐基准
     chunks_path = index_dir / "chunks.jsonl"
     with open(chunks_path, "w", encoding="utf-8") as f:
         for chunk in chunks:
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
-    # 向量化（可选）：未配置 embedding 时删除旧向量并标记纯 BM25 模式
-    vectors_path = index_dir / "vectors.npy"
+    # 向量化（可选）：写入 Qdrant（见 ADR-007）
+    # 先编码成功再清理旧点，避免编码中途失败把已有向量清空
     if config.EMBEDDING_ENABLED:
         vectors = _embed_texts([c["text"] for c in chunks])
-        np.save(vectors_path, vectors)
-    elif vectors_path.exists():
-        vectors_path.unlink()
+        try:
+            if force:
+                vector_store.delete_kb(kb_name)
+            vector_store.upsert(kb_name, chunks, vectors)
+        except QdrantUnavailable as e:
+            raise RuntimeError(
+                f"向量写入 Qdrant 失败，请确认向量库已启动（{config.QDRANT_URL}）: {e}"
+            ) from e
+
+    # 早期版本把向量存为本地 vectors.npy，改用 Qdrant 后清理历史残留
+    stale_vectors = index_dir / "vectors.npy"
+    if stale_vectors.exists():
+        stale_vectors.unlink()
 
     meta = {
         "files": unchanged_files,
         "vector_enabled": config.EMBEDDING_ENABLED,
+        "vector_store": "qdrant" if config.EMBEDDING_ENABLED else "",
+        "qdrant_collection": config.QDRANT_COLLECTION if config.EMBEDDING_ENABLED else "",
         "embedding_model": config.EMBEDDING_MODEL if config.EMBEDDING_ENABLED else "",
         "chunk_size": config.CHUNK_SIZE,
         "chunk_overlap": config.CHUNK_OVERLAP,
@@ -186,7 +209,7 @@ if __name__ == "__main__":
     results = ingest_all(force="--force" in sys.argv)
     for item in results:
         status = "已更新" if item["updated"] else "无变化"
-        vector_status = "向量+BM25" if item["vector"] else "纯 BM25"
+        vector_status = "向量(Qdrant)+BM25" if item["vector"] else "纯 BM25"
         print(
             f"[{item['kb']}] {status} | 文档 {item['docs']} 份 | "
             f"chunk {item['chunks']} 条 | 检索模式: {vector_status}"

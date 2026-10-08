@@ -1,8 +1,17 @@
-# DeepSearch Agents 本地 MySQL 教学环境
+# DeepSearch Agents 本地服务环境（MySQL + 本地 embedding 服务 + Qdrant 向量库）
 #
-# 运行位置：在 docker 目录执行 docker compose up -d。
+# 运行位置：在项目根目录执行
+#   docker compose --env-file .env -f docker/docker-compose.yaml up -d
 # 首次启动时，mysql/mysql.sql 会被官方镜像自动导入到 deepsearch_db。
 # 如果数据卷已存在，MySQL 不会重复执行初始化脚本，需要重建 volume 才会重新导入。
+#
+# 三个服务都是「可选」的，缺任何一个系统仍能跑：
+#   mysql      业务数据信源（未启动时数据库查询助手不可用）
+#   embedding  自建 RAG 的向量化后端（见 ADR-006）：HuggingFace text-embeddings-inference
+#              加载 bge-large-zh-v1.5，提供原生 /embed 与 OpenAI 兼容的 /v1/embeddings（1024 维）。
+#              模型文件需放在 docker/embedding/bge-large-zh-v1.5/（约 1.3GB，不入 git）
+#   qdrant     向量库（见 ADR-007）：存放 chunk 向量，与 BM25 组成双路检索
+# embedding 或 qdrant 未启动时，知识库检索自动降级为纯 BM25，不影响系统其余功能。
 
 name: deepsearch-agents
 
@@ -40,5 +49,52 @@ services:
       retries: 10
       start_period: 30s
 
+  embedding:
+    # CPU 版推理镜像；本地已有该镜像时不会重新拉取（约 938MB）
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    platform: linux/amd64
+    container_name: deepsearch-embedding
+    restart: unless-stopped
+    command: ["--json-output"]
+    ports:
+      # 对应 .env 的 EMBEDDING_BASE_URL=http://localhost:8081/v1
+      - "${EMBEDDING_PORT:-8081}:80"
+    environment:
+      MODEL_ID: /models/bge-large-zh-v1.5
+      # bge-large-zh-v1.5 最大输入 512 token，超长会返回 413；
+      # 摄入侧已把 chunk 控制在 400 字符以内，此处保持默认不自动截断便于暴露配置问题
+      MAX_CONCURRENT_REQUESTS: "16"
+      MAX_BATCH_TOKENS: "16384"
+    volumes:
+      # 模型目录随项目走，不依赖任何外部项目；文件较大，已在 .gitignore 中排除
+      - ./embedding/bge-large-zh-v1.5:/models/bge-large-zh-v1.5:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      # 1.3GB 模型在 CPU 上冷启动需要较长时间，给足预热窗口
+      start_period: 300s
+
+  qdrant:
+    # 向量库（见 ADR-007）：chunk 向量的持久化与相似度检索
+    image: qdrant/qdrant:v1.16
+    container_name: deepsearch-qdrant
+    restart: unless-stopped
+    ports:
+      # 6333 = REST API + Web dashboard（http://localhost:6333/dashboard）
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      # 向量持久化：容器重建后索引仍在，不必重新摄入
+      - deepsearch_qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
 volumes:
   deepsearch_mysql_data:
+  deepsearch_qdrant_data:

@@ -30,6 +30,9 @@ tmp/
 # Local research materials and test uploads
 docs/knowledge_base/
 
+# Local embedding model files (docker/embedding/bge-large-zh-v1.5, ~1.3GB)
+docker/embedding/bge-large-zh-v1.5/
+
 # IDE and operating-system files
 .idea/
 .DS_Store

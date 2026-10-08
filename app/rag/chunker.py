@@ -120,7 +120,7 @@ def _extract_markdown(file_path: Path) -> list[TextBlock]:
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[。！？；!?;])")
 
 
-def chunk_text(block: TextBlock, source_doc: str) -> list[dict]:
+def chunk_text(block: TextBlock, source_doc: str, block_index: int = 1) -> list[dict]:
     """
     把单个 TextBlock 切分为目标长度的 chunk 列表
 
@@ -128,44 +128,52 @@ def chunk_text(block: TextBlock, source_doc: str) -> list[dict]:
     相邻 chunk 保留 CHUNK_OVERLAP 重叠。
     :param block: 提取得到的文本块
     :param source_doc: 所属文档名（写入 chunk 元数据，供检索结果溯源）
+    :param block_index: 该块在文档内的序号，用于保证 id 在「同标题的多个块」之间也不冲突
     :return: chunk 字典列表，字段 id / doc / heading / text
     """
     text = block.text.strip()
     if not text:
         return []
 
-    # 不超目标长度：整块作为一个 chunk，无需切分
     if len(text) <= CHUNK_SIZE:
-        return [_make_chunk(source_doc, block.heading, text)]
+        # 不超目标长度：整块作为一个 chunk，无需切分
+        chunks = [_make_chunk(source_doc, block.heading, text)]
+    else:
+        chunks = _split_long_text(text, source_doc, block.heading)
 
-    # 超长：按句子边界下钻
+    # 统一编号：id 必须对**所有** chunk 赋值。早期版本只在超长分支里编号，
+    # 导致未切分的短块 id 为空字符串——写入 Qdrant 时这些块被 uuid5 折叠成
+    # 同一个 point，向量严重丢失（617 个 chunk 只剩 539 个点）。
+    for seq, chunk in enumerate(chunks, start=1):
+        chunk["id"] = f"{source_doc}::{block_index}::{block.heading or 'body'}::{seq}"
+    return chunks
+
+
+def _split_long_text(text: str, source_doc: str, heading: str) -> list[dict]:
+    """超长文本按句子边界下钻切分（返回尚未编号的 chunk 列表）"""
     sentences = [s for s in _SENTENCE_BREAK_RE.split(text) if s.strip()]
-    chunks = []
+    chunks: list[dict] = []
     buffer = ""
     for sentence in sentences:
         # 单句超过目标长度（如长表格、URL 堆积）：按目标长度硬切
         if len(sentence) > CHUNK_SIZE:
             if buffer:
-                chunks.append(_make_chunk(source_doc, block.heading, buffer))
+                chunks.append(_make_chunk(source_doc, heading, buffer))
                 buffer = ""
             for i in range(0, len(sentence), CHUNK_SIZE - CHUNK_OVERLAP):
                 piece = sentence[i : i + CHUNK_SIZE]
                 if piece.strip():
-                    chunks.append(_make_chunk(source_doc, block.heading, piece))
+                    chunks.append(_make_chunk(source_doc, heading, piece))
             continue
 
         if len(buffer) + len(sentence) > CHUNK_SIZE and buffer:
-            chunks.append(_make_chunk(source_doc, block.heading, buffer))
+            chunks.append(_make_chunk(source_doc, heading, buffer))
             # overlap：新块以旧块尾部开头，保证跨块语义连续
             buffer = buffer[-CHUNK_OVERLAP:] + sentence
         else:
             buffer += sentence
     if buffer.strip():
-        chunks.append(_make_chunk(source_doc, block.heading, buffer))
-
-    # 给每个 chunk 编上块内序号，保证 id 在文档内唯一且稳定
-    for seq, chunk in enumerate(chunks, start=1):
-        chunk["id"] = f"{source_doc}::{block.heading or seq}::{seq}"
+        chunks.append(_make_chunk(source_doc, heading, buffer))
     return chunks
 
 
