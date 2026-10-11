@@ -3,7 +3,7 @@
 > 目标：为 deepsearch-agents 建立一套可复现的评测集与判分协议，产出「反思循环前后对比」的量化数字。
 > 核心认知：**deep research 系统的输出是研究报告，不是短答案**——不能用「标准答案精确匹配」的思路建评测集，必须用「关键事实命中 + 过程指标」的组合判分。
 >
-> 备注：知识库类任务运行在自建 RAG 之上（ADR-006），当前 embedding / Qdrant / Elasticsearch 均已接入。可用同一评测集跑出「进程内 BM25 vs ES 关键词 vs 向量 vs RRF 融合」四模式的检索质量对比（`python -m scripts.compare_retrieval`）——这是免费的第二组对比数据。
+> 备注：知识库类任务运行在自建 RAG 之上（ADR-006），当前 embedding / Qdrant / Elasticsearch 均已接入，检索链路的生产默认模式为 `hybrid_rerank`（RRF 融合 + cross-encoder 精排，ADR-012；每路候选 25 条，ADR-013）。检索层可独立评测：`python -m app.eval.eval_retrieval` 用同一份题库跑出「进程内 BM25 vs ES 关键词 vs 向量 vs RRF 融合 vs RRF+精排」五模式的检索质量对比（指标口径见 3.4 节）——这是免费的第二组对比数据。精排将 Recall@5 从 59.3% 提到 87.0%（候选池上限 91.7%）。
 
 ---
 
@@ -55,6 +55,8 @@ judge 用 `with_structured_output(..., method="json_mode")`——沿用 ADR-002 
   "fact_hits":      [{"fact": "...", "covered": true, "evidence": "报告原文片段"}],
   "unsupported_claims": ["报告中无信源支撑的关键论断"],
   "completeness":   1-5,
+  "answer_relevancy": 1-5,
+  "relevancy_reason": "为什么给这个切题分（是否正面回答了用户所问）",
   "verdict":        "pass | partial | fail",
   "reason":         "一句话理由"
 }
@@ -63,6 +65,16 @@ judge 用 `with_structured_output(..., method="json_mode")`——沿用 ADR-002 
 派生指标：
 - **事实命中率** = 命中 gold_facts 数 / 总数
 - **幻觉率** = unsupported_claims 数 / 报告关键论断总数
+- **答案相关性** = `answer_relevancy` 跨任务均值（1–5 归一化到 0–1）
+
+**completeness 与 answer_relevancy 是正交的两维，必须分开评**（对齐 RAGAs 的 Faithfulness / Answer Relevancy 之分）：
+
+| 维度 | 回答的问题 | 反例 |
+|------|-----------|------|
+| completeness（+ 事实命中率、幻觉率） | 答得**全不全 / 对不对** | 漏了关键事实、或编造了没信源支撑的论断 |
+| **answer_relevancy（新增）** | 答得**切不切题** | 「北京天气怎么样」→ 回一篇全对但无关的北京历史 —— Faithfulness 高、Answer Relevancy 低 |
+
+现有 completeness 只测「信息覆盖」，测不出「跑题」；补上 answer_relevancy 后，「有据但答非所问」这类失败才可被量化。评测协议不引入 RAGAs 框架本体（见 ADR-009）。
 
 ### 3.3 过程层（来自 monitor 事件流 + usage_metadata）
 
@@ -76,6 +88,32 @@ judge 用 `with_structured_output(..., method="json_mode")`——沿用 ADR-002 
 | 路由准确率 | 实际信源 ⊇ expected_sources 的任务比例 | 工具调用序列 |
 
 **反思触发率是本项目特有的指标**——它直接回答「反思循环是否真的在起作用」这个问题。
+
+### 3.4 检索层指标口径（2026-10-10 重定）
+
+检索层与生成层**分开评测**：检索层不依赖 LLM，可完全程序化、零成本、可复现；生成层需要真实生成的答案与 LLM judge。两层各自独立成表，避免「检索差」与「生成差」互相掩盖。
+
+| 类型 | 指标 | 衡量什么 | 口径 | 实现 |
+|------|------|---------|------|------|
+| 检索质量 | **Context Recall@5** | 相关证据是否被检索出来 | fact 级 micro：Top-5 覆盖的锚点事实数 / 该题锚点总数 | `eval_retrieval.py` |
+| 检索质量 | **Context Precision@5** | 检索结果的排序与占比是否合理 | chunk 级 AP@5（位置加权）：相关块 = 含任一锚点的块 | 同上 |
+| 检索质量 | **MRR@5** | 第一个相关结果排得是否靠前 | chunk 级：首个相关块的排名倒数，Top-5 外记 0，跨题平均 | 同上 |
+| 检索质量 | **NDCG@5** | 排序整体质量（对数折扣 + 归一化） | chunk 级二值：DCG = Σ relᵢ/log₂(i+1)，NDCG = DCG / 理想 DCG | 同上 |
+| 检索上限 | **候选池召回** | 当前配置的检索天花板 | 融合去重后、**截断成 top-5 之前**的候选集合覆盖的锚点比例 | 同上 |
+| 答案质量 | **Faithfulness** | 回答中的事实能否被检索到的上下文支持 | LLM judge：逐论断判「是否有 chunk 支撑」 | **第二阶段** |
+| 答案质量 | **Answer Correctness** | 最终答案与参考答案相比是否正确 | LLM judge：与 gold answer 比对（事实重合 + 语义一致） | **第二阶段** |
+| 性能 | **P95 延迟** | 95% 的请求在多长时间内完成 | 逐条 wall-clock 的 95 分位 | `eval_retrieval.py`（检索延迟） |
+| 诊断（--diag） | **Recall@20 / 候选池召回@100** | 区分「没召回」与「排得靠后」 | @20 放大输出；候选池把每路深度从 15 加深到 100 | 同上 |
+
+**Context Recall@5 的判定用事实锚点法，而非 RAGAs 的 reference-based 口径。** RAGAs 的 Context Recall 需要参考答案、再逐句判「该句能否归因到某 chunk」，属 LLM 判分，噪声大且不可复现；本项目用「每个 gold_fact 配一组可从原文客观判定的锚点字符串（数值、专名、术语）」实现同一语义，且每个数字都可争论、可复现。**只标注能从原文客观判定的锚点，描述型事实不配锚点、不入库**——这是这套口径的边界，也是它比 LLM 判分更硬的地方。
+
+**Context Precision@5 用 AP@5 而不是裸占比。** 用户的诉求是「排序与占比是否合理」，而裸占比（相关块数 / 5）是位置无关的——第 1、3 位相关与第 4、5 位相关得分相同。AP@5 = Σ_{i: 相关} (前 i 个中相关数 / i) / R（R = Top-5 内相关块数，R=0 记 0），同时反映占比与位置：同样是 2 个相关块，排在第 1、3 位得 0.83，排在第 4、5 位只有 0.35。报告里同时给出**裸占比作参考列**，两者对照即可区分「相关块太少」与「相关块排得太靠后」。
+
+**相关块的判定同样是锚点近似**（含任一锚点即相关），不额外做 gold chunk 标注。代价是「语义相关但不含锚点」的块会被判为不相关，使绝对值偏低；收益是零标注成本、与 Recall 同源、可与 Recall 交叉解释。若将来需要与 RAGAs 数值直接对齐，再补逐题 gold chunk 集。
+
+**P95 延迟有两个必须说明的口径边界**：① 当前题库 39 条查询，P95 ≈ 第 2 慢的那条，统计上不稳健——报告同时给出 P50 / max 与样本数，不单看 P95；要真正谈 P95 需要 ≥100 条查询。② 这是**检索延迟**（两路检索 + RRF 融合 + query embedding，百毫秒量级）；**端到端延迟**（含 LLM 生成，秒到分钟量级）在生成层统计，两者不能混为一表。
+
+**生成层两个指标留到第二阶段**（2026-10-10 决策）。理由：Faithfulness 需要真实生成的答案，Answer Correctness 还需要**参考答案（gold answer）**这一全新的标注资产——两者都依赖 LLM judge 的落地（judge 协议见 3.2，代码尚未实现）。分阶段的顺序是：先把检索层指标与口径稳定下来（含之后要加的 rerank），再做生成层。届时还需决定评测对象：评「给定检索结果 → 单轮 RAG 回答」（可控、能隔离检索质量与编排质量）还是「agent 最终产出的研究报告」（贴产品形态、但需跑完整 agent 且参考答案要写到报告粒度）。
 
 ## 4. 对比实验协议
 

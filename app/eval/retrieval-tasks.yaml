@@ -1,0 +1,341 @@
+# 检索层评测集（fact-anchor 版）
+#
+# 唯一消费方：app/eval/eval_retrieval.py（每次运行从本文件读题，不再把题目写在代码里）。
+# 新增题目 = 追加一条 case + 按下方铁律校准锚点；改题目不需要动代码。
+#
+# ---------------------------------------------------------------------------
+# 锚点校准铁律（都是实际踩过的坑，见 app/eval/eval.md 第 5 节）
+#   1. 锚点必须对着原文核，不能凭记忆写：原文写作 `2,859`（带千分位），
+#      锚点写 `2859` 会永远判不中，系统性压低 Recall。
+#   2. 裸百分比不能当锚点：含 `20%` 的 chunk 占 IEA 全文 5.9%、`30%` 占 4.4%，
+#      且会跨文档命中同库的中文报告。一律改用英文长短语。
+#   3. 锚点要指向「正确的那件事」：`one in four` 在 IEA 原文里指中国出口，
+#      而「全球每四辆新车一辆电动」的原文是 `one-quarter of all new cars`。
+#   4. PDF 提取会留双空格：原文 `more  than 30%` 导致 `more than 30% to reach`
+#      命中 0，改用 `30% to reach` 才匹配——锚点要避开跨空格的片段。
+#   5. 写完先做特异性校验：统计每个锚点在库内命中的 chunk 数与占比，
+#      0 命中或占比 >3% 的一律回炉重写。
+#
+# ---------------------------------------------------------------------------
+# 字段说明
+#   id        题目编号（报告与明细里用它定位）
+#   kb        知识库名（= docs/knowledge_base/ 下的目录名，检索按此过滤）
+#   doc       答案所在文档的文件名（= 该文档入库时的 <doc> 元数据）。跳过判定的依据：
+#             只有「所属知识库已入库」且「该文档在库内的 meta.files 清单里」才跑该题。
+#             注意必须下沉到文档级——一个知识库常含多份文档，仅看库是否存在会把
+#             「锚在未入库文档上」的题目当成有效题，全 0 分混进报表（2026-10-10 踩到）
+#   doc_lang  答案所在文档的语言（zh/en），用于「查询语言 × 文档语言」二维分组，
+#             这是定位跨语言失配的关键维度
+#   queries   问句集合：至少含 zh；有 en/mixed 的题目按查询语言分组统计。
+#             同一题的多个问句共享同一组 facts（锚点描述的是事实，与问句语言无关）
+#   facts     fact 级锚点：每个 fact 含一组 patterns，Top-k 拼接文本里任一 pattern
+#             出现即视为该事实被召回。patterns 为「或」关系，用于兼容原文的多种写法
+#   notes     校准说明（为什么用这个锚点、原文怎么写），不参与计算
+# ---------------------------------------------------------------------------
+
+cases:
+  # ===================== 新能源汽车出海 / ICCT（英文文档，380 chunk）=====================
+  - id: icct-q1
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年全球轻型电动汽车（LDV）的销量是多少？占新车总销量的比例是多少？"
+      en: "How many light-duty electric vehicles were sold globally in 2025, and what share of new LDV sales did they represent?"
+      mixed: "2025年 global LDV 的 EV sales 是多少？占 new car sales 的 share 是多少？"
+    facts:
+      - name: 全球销量超2000万
+        patterns: ["over 20 million"]
+      - name: 占新LDV约25%
+        patterns: ["about 25% of new LDVs"]
+
+  - id: icct-q2
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年纯电动汽车（BEV）的全球销量是多少？它在新电动车和新轻型车中分别占多大比例？"
+      en: "What were the global sales of battery electric vehicles (BEVs) in 2025, and what shares did they account for among new EVs and new LDVs?"
+      mixed: "2025年 BEV（battery electric vehicle）的 global sales 是多少？占 new EVs 和 new LDVs 的比例分别多少？"
+    facts:
+      - name: BEV销量1400万
+        patterns: ["14 million units sold"]
+      - name: 占新EV 67%
+        patterns: ["67% of new EVs"]
+      - name: 占新LDV 17%
+        patterns: ["17% of new LDVs"]
+
+  - id: icct-q3
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年中国的电动汽车销量、在全球市场中的占比，以及国内的电动车渗透率分别是多少？"
+      en: "What were China's EV sales in 2025, its share of the global EV market, and its domestic EV penetration rate?"
+      mixed: "2025年 China 的 EV sales、它的 global market share，以及 domestic EV penetration 分别是多少？"
+    facts:
+      - name: 中国销量近1300万
+        patterns: ["nearly 13 million EVs were sold in China"]
+      - name: 占全球约62%
+        patterns: ["approximately 62%"]
+      - name: 中国渗透率52%
+        patterns: ["52% of new LDVs sold in the country"]
+
+  - id: icct-q4
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年欧洲和美国的电动汽车销量及渗透率分别是多少？"
+      en: "What were the EV sales volumes and penetration rates in Europe and the United States in 2025?"
+      mixed: "2025年 Europe 和 United States 的 EV sales 和 penetration rate 分别是多少？"
+    facts:
+      - name: 欧洲销量410万
+        patterns: ["4.1 million EVs were sold"]
+      - name: 欧洲渗透率27%
+        patterns: ["27% of all new LDVs"]
+      - name: 美国销量150万
+        patterns: ["1.5 million EVs in 2025"]
+      - name: 美国渗透率9%
+        patterns: ["9% of all new LDVs"]
+
+  - id: icct-q5
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年印度的电动汽车销量相比2024年增长了多少？渗透率是多少？"
+      en: "How much did India's EV sales grow in 2025 compared with 2024, and what was its EV penetration rate?"
+      mixed: "2025年 India 的 EV sales 相比 2024 增长了多少？EV penetration 是多少？"
+    facts:
+      - name: 印度12.5万→20.2万
+        patterns: ["125,000 in 2024 to 202,000 in 2025"]
+      - name: 印度渗透率4%
+        patterns: ["4% of new LDV sales"]
+
+  - id: icct-q6
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年新兴市场的电动汽车销量表现如何？哪个国家的电动车渗透率最高？"
+      en: "How did EV sales perform in emerging markets in 2025, and which country had the highest EV sales share?"
+      mixed: "2025年 emerging markets 的 EV sales 表现如何？哪个国家 EV sales share 最高？"
+    facts:
+      - name: 新兴市场合计200万
+        patterns: ["approximately 2 million EVs were sold in these markets collectively"]
+      - name: 11个新兴市场约100万
+        patterns: ["11 emerging markets sold approximately 1 million EVs"]
+      - name: 越南渗透率最高37%
+        patterns: ["Vietnam reached an EV sales share of 37%"]
+
+  - id: icct-q7
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年中国、日本、韩国生产的电动汽车主要在国内销售还是出口？"
+      en: "In 2025, were EVs produced in China, Japan, and South Korea mainly sold domestically or exported?"
+      mixed: "2025年 China、Japan、South Korea 生产的 EVs 主要是 sold domestically 还是 exported？"
+    facts:
+      - name: 中国生产87%内销
+        patterns: ["87% of EVs produced in China were sold domestically"]
+      - name: 日本70%出口
+        patterns: ["Japan (70%)"]
+      - name: 韩国56%出口
+        patterns: ["South Korea (56%)"]
+
+  # ===================== 金融行业 / 贝莱德（中文文档，76 chunk）=====================
+  - id: blk-q1
+    kb: 金融行业
+    doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
+    doc_lang: zh
+    queries:
+      zh: "2026年全球投资展望中，人工智能建设的资本支出规模预计有多大？报告估算它能为经济额外创造多少收入？"
+      en: "In the 2026 Global Investment Outlook, how large is the projected capital expenditure on the AI buildout, and how much additional revenue does the report estimate it will create for the economy?"
+      mixed: "2026 Global Investment Outlook 里，AI buildout 的 capex 预计多大？报告估算能额外创造多少 income？"
+    facts:
+      - name: 资本支出目标 5-8 万亿美元
+        patterns: ["5至8万亿", "5-8万亿"]
+      - name: 额外创造 1.1 万亿美元收入
+        patterns: ["1.1万亿"]
+      - name: 生产力贡献 1.5%
+        patterns: ["1.5%"]
+
+  - id: blk-q2
+    kb: 金融行业
+    doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
+    doc_lang: zh
+    queries:
+      zh: "报告提出的三大投资主题分别是什么？"
+      en: "What are the three major investment themes proposed in the report?"
+      mixed: "报告提出的三大 investment themes 分别是什么？"
+    facts:
+      - name: 主题1 微观即宏观
+        patterns: ["微观即宏观"]
+      - name: 主题2 金融杠杆进行时
+        patterns: ["金融杠杆进行时"]
+      - name: 主题3 分散投资的幻象
+        patterns: ["分散投资的幻象"]
+
+  - id: blk-q3
+    kb: 金融行业
+    doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
+    doc_lang: zh
+    queries:
+      zh: "人工智能建设在美国面临哪些物理层面的制约？到2030年数据中心的电力需求预计达到什么程度？"
+      en: "What physical constraints does the AI buildout face in the US, and what level of data center power demand is expected by 2030?"
+      mixed: "AI buildout 在美国面临哪些 physical constraints？到 2030 年 data center 的 power demand 预计多高？"
+    facts:
+      - name: 制约：算力与能源
+        patterns: ["算力与能源", "物理层面的制约", "能源限制"]
+      - name: 电力需求占四分之一
+        patterns: ["四分之一"]
+
+  - id: blk-q4
+    kb: 金融行业
+    doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
+    doc_lang: zh
+    queries:
+      zh: "报告对股票和固定收益资产给出的主要配置观点有哪些（美国股票、中国、日本、长期投资级别信用债）？"
+      en: "What are the report's main allocation views on equities and fixed income (US equities, China, Japan, long-term investment-grade credit)?"
+      mixed: "报告对 equities 和 fixed income 的主要 allocation views 是什么（US equities、China、Japan、long-term IG credit）？"
+    facts:
+      - name: 超配美国股票
+        patterns: ["超配美国股票"]
+      - name: 中国持中性观点
+        patterns: ["中国我们持中性观点"]
+      - name: 看好日本股票
+        patterns: ["看好日本股票"]
+      - name: 长期投资级别信用债低配
+        patterns: ["长期投资级别信用债我们持低配观点"]
+
+  - id: blk-q5
+    kb: 金融行业
+    doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
+    doc_lang: zh
+    queries:
+      zh: "报告如何描述稳定币的兴起及其对金融体系的影响？"
+      en: "How does the report describe the rise of stablecoins and their impact on the financial system?"
+      mixed: "报告如何描述 stablecoins 的兴起及对 financial system 的影响？"
+    facts:
+      - name: 稳定币是数字金融体系的结构性要素
+        patterns: ["稳定币已成为数字金融体系的结构性要素"]
+      - name: 与法定货币挂钩
+        patterns: ["与法定货币"]
+
+  - id: blk-q6
+    kb: 金融行业
+    doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
+    doc_lang: zh
+    queries:
+      zh: "报告对新兴市场中的印度给出了什么配置建议？"
+      en: "What allocation recommendation does the report give for India in emerging markets?"
+      mixed: "报告对 emerging markets 中的 India 给出了什么 allocation 建议？"
+    facts:
+      - name: 高于基准权重配置印度股票
+        patterns: ["高于基准水平的权重配置印度股票"]
+      - name: 人口结构是印度最核心优势
+        patterns: ["人口结构是印度最核心"]
+
+  # ===================== 单语题（等对应知识库入库后可跑）=====================
+  # 这几题的锚点锚在「人工智能产业」与「新能源汽车出海」的其他文档上。
+  # 对应文档尚未重新入库时，eval_retrieval 会自动跳过并告警（不会当成 0 分计入）。
+
+  - id: kb-06
+    kb: 人工智能产业
+    doc: 中国信通院-具身智能发展报告（2025年）.pdf
+    doc_lang: zh
+    queries:
+      zh: "中国信通院《具身智能发展报告（2025年）》中，截至 2025 年 12 月我国具身智能和机器人领域的投资事件数与融资总额分别是多少？报告把具身智能产品分为哪两类载体，各自要解决什么问题？"
+    notes: "锚点特异性已校验：744 → 3/2036 chunk、735.43 → 2、移动类 / 操作类 各 1，无假阳性风险"
+    facts:
+      - name: 投资事件数 744 起
+        patterns: ["744"]
+      - name: 融资总额 735.43 亿元
+        patterns: ["735.43"]
+      - name: 移动类载体（去哪里）
+        patterns: ["移动类"]
+      - name: 操作类载体（干什么）
+        patterns: ["操作类"]
+
+  - id: kb-07
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》如何判断中美 AI 模型性能差距？报告给出的 AI 私人投资规模、生成式 AI 采用率与 AI 事故数量分别是多少？它用什么说法描述 AI 能力发展的不均衡？"
+    notes: "校准要点：投资额原文写作「2,859 亿美元」（带千分位逗号），锚点写 2859 会永远判不中"
+    facts:
+      - name: 中美模型差距 2.7%
+        patterns: ["2.7%"]
+      - name: 美国私人 AI 投资 2,859 亿美元
+        patterns: ["2,859"]
+      - name: 生成式 AI 采用率 88%（组织）
+        patterns: ["88%"]
+      - name: 生成式 AI 采用率 53%（人口）
+        patterns: ["53%"]
+      - name: AI 事故 362 起（2025）
+        patterns: ["362"]
+      - name: AI 事故 233 起（2024）
+        patterns: ["233"]
+      - name: 「锯齿状」智能
+        patterns: ["锯齿"]
+
+  - id: kb-08
+    kb: 新能源汽车出海
+    doc: 中国信通院-智能网联汽车（车联网）蓝皮书（2025年）.pdf
+    doc_lang: zh
+    queries:
+      zh: "中国信通院与中国通信学会《智能网联汽车（车联网）蓝皮书（2025年）》中，智能网联汽车的核心应用场景有哪些？支撑产业发展的「车-路-网-云」四大要素各自的技术趋势是什么？"
+    notes: "「自动驾驶」命中 53/2767（1.9%），是三个场景词中最泛的一个，但作为「场景清单」的宽松判定可接受；四要素只保留原文写法「车-路-网-云」（5 chunk）"
+    facts:
+      - name: 场景：智能座舱
+        patterns: ["智能座舱"]
+      - name: 场景：组合驾驶辅助
+        patterns: ["组合驾驶辅助"]
+      - name: 场景：自动驾驶
+        patterns: ["自动驾驶"]
+      - name: 四要素：车-路-网-云
+        patterns: ["车-路-网-云"]
+
+  - id: kb-09
+    kb: 新能源汽车出海
+    doc: 德勤-生成式AI驱动汽车产业价值重构.pdf
+    doc_lang: zh
+    queries:
+      zh: "德勤与亚马逊云科技联合发布的《生成式AI驱动汽车产业价值重构》白皮书中，生成式 AI 在汽车产业的哪些环节推动了价值重构？这份白皮书的撰写分工是怎样的？"
+    notes: >-
+      只保留可客观判定的事实。「价值重构环节」过于笼统（研发 / 营销这类泛词命中率
+      1.6% / 0.9%，判不出真假），不参与计算。撰写分工原文：德勤负责【摘要，第一、二、
+      三、五章节】，亚马逊云科技负责【第四章】。
+    facts:
+      - name: 撰写分工：德勤负责摘要及第一、二、三、五章
+        patterns: ["第一、二、三、五"]
+
+  - id: kb-10
+    kb: 新能源汽车出海
+    doc: IEA-Global EV Outlook 2026.pdf
+    doc_lang: en
+    queries:
+      zh: "依据 IEA《Global EV Outlook 2026》，2025 年全球电动汽车销量与市场份额是多少？欧洲市场增长情况如何？报告如何描述中国在电动汽车出口与海外市场中的角色？"
+    notes: >-
+      三条校准要点（都是实际踩到的坑）：1) 裸百分比在 IEA 里极泛（含 "20%" 的 chunk 占
+      5.9%、"30%" 占 4.4%），且会命中同库的中文德勤报告，一律改用英文长短语作锚点；
+      2) 原文对全球份额的表述是 "one-quarter of all new cars"，而 "one in four" 在文中
+      指中国出口（"over one in four electric cars ... made in China"），用它当锚点会判到
+      错误的事实上；3) 该文档全文英文，检索侧 embedding 是中文优化的 bge-large-zh-v1.5，
+      构成天然的跨语言检索样本。
+    facts:
+      - name: 2025 全球销量超 2000 万辆
+        patterns: ["exceed 20 million", "topped 20 million"]
+      - name: 全球每四辆新车一辆电动（one-quarter）
+        patterns: ["one-quarter of all new cars"]
+      - name: 欧洲销量增长超 30%
+        patterns: ["30% to reach"]
+      - name: 欧洲占其总销量 28%
+        patterns: ["28% of total sales"]
+      - name: 中国汽车出口中电动车超 35%
+        patterns: ["35% of China"]
+      - name: 非欧美市场中国进口车占 55%
+        patterns: ["55% of electric car sales"]

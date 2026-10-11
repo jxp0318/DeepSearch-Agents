@@ -1,5 +1,5 @@
-# deepsearch-agents 评测集 v0（20 条，待首跑校准）
-# 依据 docs/eval.md 第 5 节校准流程：DB 类 gold_facts 基于表结构推断，
+# deepsearch-agents 评测集 v0（27 条，待首跑校准）
+# 依据 app/eval/eval.md 第 5 节校准流程：DB 类 gold_facts 基于表结构推断，
 # 首跑时必须对照库内真实数据修正；KB 类对照 PDF 原文核对；web 类核对事实锚点当前可搜。
 
 # ========== 数据库类（5 条，信源：deepsearch_db 制药业务库）==========
@@ -59,13 +59,13 @@
     - "最优组合的具体区域与领域名"
     - "该区域主要客户（customer_name）"
 
-# ========== 知识库类（5 条，信源：自建 RAG 知识库，电商/金融 5 份 PDF）==========
+# ========== 知识库类（10 条，信源：自建 RAG 知识库，4 库共 11 份 PDF）==========
 
 - id: kb-01
   category: knowledge_base
   difficulty: easy
   query: 2026 数字人电商直播白皮书中，数字人直播主要应用于哪些电商场景？
-  expected_sources: [ragflow]
+  expected_sources: [knowledge_base]
   must_reflect: false
   gold_facts:
     - "白皮书列出的主要应用场景清单（校准时对照原文）"
@@ -74,7 +74,7 @@
   category: knowledge_base
   difficulty: medium
   query: 贝莱德 2026 年全球投资展望对全球股票市场的核心观点是什么？给出了哪些大类资产配置建议？
-  expected_sources: [ragflow]
+  expected_sources: [knowledge_base]
   must_reflect: false
   gold_facts:
     - "对股票市场的核心判断"
@@ -84,7 +84,7 @@
   category: knowledge_base
   difficulty: medium
   query: 长江商学院 2025 年四季度投资者情绪调查中，投资者对 A 股的预期如何？与对其他资产的预期相比有什么差异？
-  expected_sources: [ragflow]
+  expected_sources: [knowledge_base]
   must_reflect: false
   gold_facts:
     - "对 A 股预期的关键调查结论"
@@ -94,7 +94,7 @@
   category: knowledge_base
   difficulty: hard
   query: 中国人民银行 2025 年第四季度货币政策执行报告中，对下一阶段货币政策的基调是什么？报告认为当前经济运行中的主要问题有哪些？
-  expected_sources: [ragflow]
+  expected_sources: [knowledge_base]
   must_reflect: false
   gold_facts:
     - "货币政策基调表述"
@@ -105,11 +105,74 @@
   category: knowledge_base
   difficulty: hard
   query: 对比电商行业 AI 应用研究报告与数字人电商直播白皮书，两份报告对 AI 在电商中的应用趋势有哪些共同判断？各自独有的观点是什么？
-  expected_sources: [ragflow]
+  expected_sources: [knowledge_base]
   must_reflect: true   # 跨文档对比，单轮检索大概率只命中一份
   gold_facts:
     - "两份报告的共同判断（至少 2 条）"
     - "各自独有观点（至少各 1 条）"
+
+- id: kb-06
+  category: knowledge_base
+  difficulty: medium
+  query: 中国信通院《具身智能发展报告（2025年）》中，截至 2025 年 12 月我国具身智能和机器人领域的投资事件数与融资总额分别是多少？报告把具身智能产品分为哪两类载体，各自要解决什么问题？
+  expected_sources: [knowledge_base]
+  must_reflect: false
+  gold_facts:
+    - "投资事件数与融资总额（744 起 / 735.43 亿元）"
+    - "移动类载体及对应问题（去哪里）"
+    - "操作类载体及对应问题（干什么）"
+  note: 数值型 gold_fact，首跑时对照 PDF 原文核对；该报告由信通院与清华大学电子工程系联合编制
+
+- id: kb-07
+  category: knowledge_base
+  difficulty: hard
+  query: 斯坦福《2026 年人工智能指数报告》如何判断中美 AI 模型性能差距？报告给出的 AI 私人投资规模、生成式 AI 采用率与 AI 事故数量分别是多少？它用什么说法描述 AI 能力发展的不均衡？
+  expected_sources: [knowledge_base]
+  must_reflect: false
+  gold_facts:
+    - "中美模型差距的判断（截至 2026 年 3 月约 2.7%）"
+    - "2025 年美国私人 AI 投资规模（约 2859 亿美元）"
+    - "生成式 AI 采用率（组织 88% / 人口 53%）"
+    - "有记录的 AI 事故数量（2025 年 362 起，2024 年 233 起）"
+    - "描述能力分布不均衡的提法（「锯齿状」智能）"
+  note: 425 页长文档（官方中文版），考察长上下文综合与数字命中
+
+- id: kb-08
+  category: knowledge_base
+  difficulty: medium
+  query: 中国信通院与中国通信学会《智能网联汽车（车联网）蓝皮书（2025年）》中，智能网联汽车的核心应用场景有哪些？支撑产业发展的「车-路-网-云」四大要素各自的技术趋势是什么？
+  expected_sources: [knowledge_base]
+  must_reflect: false
+  gold_facts:
+    - "核心场景清单（智能座舱 / 信息提醒服务 / 组合驾驶辅助 / 自动驾驶 / 交通管理）"
+    - "「车-路-网-云」四要素对应的技术趋势"
+
+- id: kb-09
+  category: knowledge_base
+  difficulty: medium
+  query: 德勤与亚马逊云科技联合发布的《生成式AI驱动汽车产业价值重构》白皮书中，生成式 AI 在汽车产业的哪些环节推动了价值重构？这份白皮书的撰写分工是怎样的？
+  expected_sources: [knowledge_base]
+  must_reflect: false
+  gold_facts:
+    - "生成式 AI 在汽车产业的价值重构环节"
+    - "撰写分工（德勤负责摘要及第一、二、三、五章；亚马逊云科技负责第四章）"
+  note: 报告全称为《智驭变革：生成式AI驱动汽车产业价值重构》
+
+- id: kb-10
+  category: knowledge_base
+  difficulty: hard
+  query: 依据 IEA《Global EV Outlook 2026》，2025 年全球电动汽车销量与市场份额是多少？欧洲市场增长情况如何？报告如何描述中国在电动汽车出口与海外市场中的角色？
+  expected_sources: [knowledge_base]
+  must_reflect: false
+  gold_facts:
+    - "2025 年全球电动汽车销量增长 20% 至超过 2000 万辆，占全球新车销量约 25%（每四辆新车一辆电动）"
+    - "欧洲电气化乘用车销量增长超 30%，占其总销量 28%"
+    - "2025 年中国汽车出口中电动车占比超 35%（2024 年为 20%）"
+    - "欧洲与美国以外的市场，中国进口电动车占当地电动车销量的 55%（五年前不足 5%）"
+  note: >-
+    全文为英文（295 页，CC BY 4.0）。这是评测集里唯一一份纯英文文档，而检索侧的
+    embedding 模型是 bge-large-zh-v1.5（中文优化），构成一个天然的跨语言检索样本——
+    首跑时重点观察该题召回质量，可作为「中文查询 / 英文语料」边界的实测证据。
 
 # ========== 网络类（5 条，信源：Tavily；答案可能漂移，判分看来源支撑）==========
 
@@ -168,7 +231,7 @@
     - "头部厂商格局描述"
     - "趋势判断有数据来源支撑"
 
-# ========== 混合类（5 条，多信源综合，反思循环的主战场）==========
+# ========== 混合类（7 条，多信源综合，反思循环的主战场）==========
 
 - id: mix-01
   category: mixed
@@ -185,7 +248,7 @@
   category: mixed
   difficulty: hard
   query: 根据贝莱德 2026 年全球投资展望的观点，结合知识库中投资者情绪调查的数据，当前散户投资者的行为与机构建议之间存在哪些背离？
-  expected_sources: [ragflow]
+  expected_sources: [knowledge_base]
   must_reflect: true   # 两份金融文档交叉，单轮检索难同时命中
   gold_facts:
     - "贝莱德的核心建议"
@@ -196,7 +259,7 @@
   category: mixed
   difficulty: hard
   query: 知识库中电商 AI 应用报告提到的应用趋势，目前行业实际发展验证了哪些？给出最新的实际案例。
-  expected_sources: [ragflow, tavily]
+  expected_sources: [knowledge_base, tavily]
   must_reflect: true   # 先 KB 拿趋势，再网络找验证案例
   gold_facts:
     - "报告中的趋势清单（KB）"
@@ -217,10 +280,33 @@
   category: mixed
   difficulty: hard
   query: 参考央行 2025 年四季度货币政策报告的基调，结合最新的宏观数据，当前货币环境下医药行业融资面临什么形势？
-  expected_sources: [ragflow, tavily]
+  expected_sources: [knowledge_base, tavily]
   must_reflect: true
   gold_facts:
     - "货币政策基调（KB）"
     - "最新宏观数据（网络且有来源）"
     - "对医药融资形势的推断有依据链"
   note: KB(金融) + web + 行业推断，考察跨域综合，是最接近真实 deep research 的一题
+
+- id: mix-06
+  category: mixed
+  difficulty: hard
+  query: 对比斯坦福《2026 年人工智能指数报告》与中国信通院《人工智能产业发展研究报告（2025年）》，两份报告对中美 AI 产业格局的优势判断有何异同？各自提供了哪些对方没有的视角？
+  expected_sources: [knowledge_base]
+  must_reflect: true   # 两份长报告交叉，单轮检索难同时命中
+  gold_facts:
+    - "斯坦福报告对中美优势的归结（美国：顶尖模型数量、高影响力专利、私人投资；中国：论文量、引用量、专利总量、工业机器人装机量）"
+    - "信通院报告的生态与治理视角（开源生态、智算基础设施、标准竞争、安全治理）"
+    - "至少 1 条共同判断 + 至少 1 条视角差异或互补"
+
+- id: mix-07
+  category: mixed
+  difficulty: hard
+  query: 德勤报告认为生成式 AI 正在重构汽车产业价值链，中国信通院《智能网联汽车（车联网）蓝皮书（2025年）》则描述了 AI 大模型驱动的驾驶自动化革新。两份报告对「AI 上车」的判断有哪些相互印证与互补之处？
+  expected_sources: [knowledge_base]
+  must_reflect: true   # 需分别命中「产业价值」与「技术趋势」两路
+  gold_facts:
+    - "德勤关于生成式 AI 重构汽车产业价值的判断"
+    - "信通院蓝皮书关于 AI 大模型驱动驾驶自动化的判断"
+    - "至少 2 条相互印证或互补的结论"
+  note: 同一库内跨文档综合，与 kb-05（跨文档对比）形成同类型不同库的对照
