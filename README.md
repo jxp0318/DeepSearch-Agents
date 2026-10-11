@@ -9,7 +9,7 @@ deepsearch-agents 是一个面向复杂研究任务的对话式多智能体系�
 - 多智能体协作：主智能体负责分析、规划、调度和汇总，专业智能体分别处理网络搜索、数据库查询和知识库检索。
 - **反思循环**：每轮执行结束后由独立评估器判断信息是否足以回答原问题，不充分时识别缺口维度并驱动补充检索，最多迭代 3 轮（可通过环境变量调整），直到信息充分、轮数耗尽或 token 预算用尽。
 - 多来源研究：支持结合公开资料、结构化业务数据、私有知识库和本地上传文件完成综合分析。
-- **混合检索知识库**：自建 RAG（结构感知切分 + Qdrant 向量检索 + Elasticsearch 关键词检索），两路结果用 RRF 融合排序；ES 未启动时关键词路自动回退进程内 `rank-bm25`，embedding 或 Qdrant 不可用时向量路缺席，最差情况仍保有纯关键词检索，知识库能力不中断。
+- **混合检索知识库**：自建 RAG（结构感知切分 + Qdrant 向量检索 + Elasticsearch 关键词检索），两路结果用 RRF 融合排序，再用 cross-encoder（bge-reranker-v2-m3，进程内 ONNX）精排——候选池召回 91.7% 而 RRF 只排到 59.3%，精排补回 27.7 个百分点至 87.0%；ES 未启动时关键词路自动回退进程内 `rank-bm25`，embedding 或 Qdrant 不可用时向量路缺席，精排不可用时保持 RRF 原序，最差情况仍保有纯关键词检索，知识库能力不中断。
 - 实时过程展示：后端通过 WebSocket 推送任务状态、智能体调用、工具调用、反思评估、结果和异常信息。
 - **网络调用容错**：搜索等外部调用带「连接池重试 + 指数退避」，且失败时降级为可读错误交回模型决策（可换词重搜或改用其他信息源），不会因一次网络抖动作废整轮研搜；任务中途异常时保留已产出的部分结果并明确标注不完整。
 - 文件输入与输出：支持读取常见办公文档和文本文件，并生成 Markdown 或 PDF 报告。
@@ -46,15 +46,16 @@ deepsearch-agents/
 │  ├─ agent/              智能体配置、提示词、调度逻辑与反思循环
 │  ├─ api/                FastAPI 接口与 WebSocket 服务
 │  ├─ prompt/             提示词配置
-│  ├─ rag/                自建 RAG：文档摄入、切分、双路检索（ES 关键词 + Qdrant 向量）
+│  ├─ rag/                自建 RAG：文档摄入、切分、双路检索（ES 关键词 + Qdrant 向量）+ cross-encoder 精排
 │  ├─ tools/              搜索、数据库、文件和知识库工具
 │  ├─ utils/              路径处理与文档转换工具
 │  └─ output/             任务生成的文件
 ├─ docker/
 │  ├─ elasticsearch/      自建 ES 镜像（Dockerfile + IK 中文分词插件包）
 │  ├─ embedding/          本地 embedding 模型目录（bge-large-zh-v1.5，不入 git）
+│  ├─ reranker/           精排模型目录（bge-reranker-v2-m3 + 导出的 ONNX，不入 git）
 │  ├─ mysql/mysql.sql     MySQL 初始化数据
-│  └─ docker-compose.yaml MySQL / embedding / Qdrant / Elasticsearch 的编排（Kibana 可选）
+│  └─ docker-compose.yaml MySQL / embedding / Qdrant / Elasticsearch 的编排（Kibana、reranker 可选）
 ├─ docs/                  项目文档和界面图片
 ├─ frontend/              React 前端
 ├─ .env.example           后端环境变量示例
@@ -237,10 +238,15 @@ docker compose --env-file .env -f docker/docker-compose.yaml up -d --build elast
 - Qdrant 自带 dashboard：`http://localhost:6333/dashboard`，可查看 collection、向量与检索结果
 - Kibana（可选，镜像约 2.1GB）：`docker compose --env-file .env -f docker/docker-compose.yaml --profile kibana up -d kibana`，访问 `http://localhost:5602`，在 Dev Tools 里可直接调 `_analyze` / `_search` 观察 IK 分词与相关性打分
 
-检索质量对比（同一问题跑四种模式：进程内 BM25 / ES 关键词 / 向量 / RRF 融合）：
+检索质量对比（同一问题跑五种模式：进程内 BM25 / ES 关键词 / 向量 / RRF 融合 /
+RRF + cross-encoder 精排，输出 Context Recall@5 / Context Precision@5 / MRR@5 /
+NDCG@5 与查询延迟 P50、P95）：
 
 ```bash
-python -m scripts.compare_retrieval
+python -m app.eval.eval_retrieval            # 全部题库 × 五种模式
+python -m app.eval.eval_retrieval --diag     # 附带 Recall@20 诊断列
+python -m app.eval.eval_retrieval --mode hybrid_rerank   # 只跑精排
+python -m app.eval.eval_retrieval --list     # 只看题库与各知识库入库状态
 ```
 
 ### 6. 启动后端

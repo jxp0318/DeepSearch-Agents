@@ -24,6 +24,7 @@ frontend/.vite/
 # Runtime output and temporary files
 app/output/
 app/rag/indexes/
+app/eval/results/
 tmp/
 *.log
 
@@ -32,6 +33,9 @@ docs/knowledge_base/
 
 # Local embedding model files (docker/embedding/bge-large-zh-v1.5, ~1.3GB)
 docker/embedding/bge-large-zh-v1.5/
+
+# Local reranker model files (docker/reranker/bge-reranker-v2-m3, ~2.2GB)
+docker/reranker/bge-reranker-v2-m3/
 
 # IDE and operating-system files
 .idea/
