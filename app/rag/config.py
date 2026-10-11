@@ -38,6 +38,16 @@ EMBEDDING_MAX_CHARS = 480
 # 检索参数
 DEFAULT_TOP_K = 5          # 工具默认返回片段数
 
+# 索引 schema 版本：chunk 字段结构变更时递增，旧索引会被自动转为全量重建（见 ingest）。
+# v2 新增 lang / cjk_ratio / zh_text 三个字段（字段级语言路由，见 ADR-010）
+INDEX_SCHEMA_VERSION = 2
+
+# 语言判定阈值（见 app/rag/language.py 与 ADR-010）。均为**先验值、未做校准实验**，
+# 设计目标是「不误杀」而非最优：真正的隔离由 zh_text 字段完成，阈值只管路由决策。
+LANG_DOC_ZH_MIN_RATIO = 0.20      # 文档级：全文汉字占比 ≥ 此值判中文
+LANG_QUERY_ZH_MIN_RATIO = 0.30    # 查询级：≥ 此值判中文
+LANG_QUERY_EN_MAX_RATIO = 0.02    # 查询级：≤ 此值判英文；两者之间判中英混排
+
 # embedding 端点（OpenAI 兼容 /embeddings 协议）。三项齐全才启用向量检索；
 # 缺任一项时检索层自动降级为纯 BM25，并通过 meta.json 记录当前索引模式。
 # 推荐后端：本地 TEI 服务（HuggingFace text-embeddings-inference）加载 bge-large-zh-v1.5，
@@ -79,6 +89,37 @@ ES_INDEX = os.getenv("ES_INDEX", "deepsearch_kb")
 ES_TIMEOUT = float(os.getenv("ES_TIMEOUT", "5"))
 # 是否启用 ES 关键词路：置 0 可强制走进程内 rank_bm25（离线演示 / 评测对照用）
 ES_ENABLED = os.getenv("ES_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+
+# 精排（cross-encoder）——见 ADR-012（接入生产）/ ADR-013（候选深度定为 25）
+# 把 RRF 融合后的候选池用 cross-encoder 逐对打分重排，是检索侧最有效的杠杆：
+# 端到端实测 Recall@5 59.3% → 87.0%（每路候选 25 条），跨语言组提升最大。
+#
+# 推理走**进程内 ONNX + onnxruntime**（不走 HTTP、不走容器、不用 TEI）——这一步同时
+# 消掉了 TEI 的两个遗留问题：queue_time 排队与 candle 后端的 SIGSEGV 崩溃。
+# 模型目录里的 onnx/model.onnx 由 optimum-cli 从 model.safetensors 导出。
+#
+# 三态开关：auto（默认，仅当 CUDA 执行提供器真正可用时启用）/ 1 强制启用（允许 CPU，
+# 慢但可用）/ 0 关闭。auto 之所以要求 CUDA，是为了避免在纯 CPU 机器上把检索拖到秒级。
+RERANK_ENABLED = os.getenv("RERANK_ENABLED", "auto").strip().lower()
+RERANK_DISABLED = RERANK_ENABLED in {"0", "false", "no", "off"}
+RERANK_FORCED = RERANK_ENABLED in {"1", "true", "yes", "on"}
+
+# 模型目录（含 model.safetensors 与 onnx/ 子目录）。缺省在项目内，约 2.2GB，不入 git。
+RERANK_MODEL_DIR = Path(
+    os.getenv("RERANK_MODEL_DIR") or (PROJECT_ROOT / "docker" / "reranker" / "bge-reranker-v2-m3")
+)
+# 执行提供器偏好：auto（CUDA 优先、CPU 兜底）| cuda（只要 CUDA）| cpu
+RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "auto").strip().lower()
+# 单次前向的候选批大小：GPU 上批越大越省 kernel launch，但显存与队列延迟同增
+RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "16"))
+# 精排用的每路候选深度（0 = 沿用 top_k×3）。生产取 25：见 ADR-013 深池重测——
+# 15→25 用 +0.16s 换 +2.7pt Recall@5，是性价比拐点；再往上耗时近似线性增长
+# （精排成本对候选数线性、单候选 ≈14ms 恒定，GPU 也不例外），而质量只多 1~2pt。
+# 设 0 退回默认 15，设 40/100 可复现深池曲线（报告 app/eval/results/2026-10-10__rerank-deep-pool.md）。
+RERANK_CANDIDATE_K = int(os.getenv("RERANK_CANDIDATE_K", "25"))
+# query+chunk 拼接后的 token 上限（XLM-R 硬上限 512）；chunk 已控制在 400 字符内，
+# 正常不会触发截断，留作防御
+RERANK_MAX_LENGTH = int(os.getenv("RERANK_MAX_LENGTH", "512"))
 
 
 def list_knowledge_base_names() -> list[str]:

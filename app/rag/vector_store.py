@@ -74,13 +74,22 @@ class QdrantVectorStore:
 
     # ---------- 写入 ----------
 
-    def upsert(self, kb_name: str, chunks: list[dict], vectors: np.ndarray) -> int:
+    def upsert(
+        self,
+        kb_name: str,
+        chunks: list[dict],
+        vectors: np.ndarray,
+        seq_offset: int = 0,
+    ) -> int:
         """
         把一个知识库的全部 chunk 向量写入 Qdrant
 
         :param kb_name: 知识库名（写入 payload 作为过滤字段）
         :param chunks: chunk 列表，顺序必须与 vectors 行序一致
         :param vectors: (N, dim) 向量矩阵
+        :param seq_offset: seq 起始偏移。全量重建传 0（此时 seq 即 chunks.jsonl 行号）；
+            增量追加时传「既有行数」，使新点的 seq 等于其在 chunks.jsonl 中的真实行号，
+            与既有点的 seq 不冲突——检索端用 seq 回查本地原文，错位会取到错误内容
         :return: 写入的点数
         """
         client = self._get_client()
@@ -101,9 +110,15 @@ class QdrantVectorStore:
                     # 原文一并存入 payload：Qdrant dashboard 里能直接看到命中内容，
                     # 也让跨库检索时可以脱离本地文件独立返回结果
                     "text": chunk.get("text", ""),
+                    # 语言字段随 payload 落库（ADR-010）：向量路本身不按语言过滤
+                    # （跨语言只能靠向量弱对齐，砍掉就等于放弃英文文档的召回），
+                    # 存下来是为了 dashboard 可观测与后续「按语言过滤向量候选」的演进空间。
+                    # zh_text 不入 Qdrant——它是 ES 专属的中文可检索视图，存这里纯属冗余。
+                    "lang": chunk.get("lang", ""),
+                    "cjk_ratio": chunk.get("cjk_ratio", 0.0),
                 },
             }
-            for seq, (chunk, vector) in enumerate(zip(chunks, vectors))
+            for seq, (chunk, vector) in enumerate(zip(chunks, vectors), start=seq_offset)
         ]
 
         for start in range(0, len(points), _UPSERT_BATCH):

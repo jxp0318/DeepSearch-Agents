@@ -4,7 +4,8 @@
 流水线：扫描知识库目录 → 提取 → 切分 → 落盘原文 → embedding 写 Qdrant → 写 ES 关键词索引。
 索引按知识库组织，三处存储（见 ADR-007 / ADR-008）：
 
-    app/rag/indexes/<kb_name>/chunks.jsonl   每个 chunk 一行 JSON（id / doc / heading / text）
+    app/rag/indexes/<kb_name>/chunks.jsonl   每个 chunk 一行 JSON
+                                             （id / doc / heading / text / lang / cjk_ratio / zh_text）
     app/rag/indexes/<kb_name>/meta.json      文件哈希清单与索引模式，用于增量摄入与降级标记
     Qdrant collection (payload.kb = <kb_name>)   chunk 向量
     ES 索引 (字段 kb = <kb_name>)                chunk 原文与元数据（IK 分词倒排索引）
@@ -13,7 +14,12 @@
 chunks.jsonl 始终是原文权威副本：embedding 未配置则不写向量，ES 未启动则不写关键词索引，
 两者都只是可选增强——进程内 rank_bm25 会兜底关键词路，知识库能力不消失。
 
-增量策略：按文件 sha256 跳过未变化的文档，只重摄入新增或修改的文件。
+增量策略：按文件 sha256 跳过未变化的文档，只重摄入新增或修改的文件；
+索引 schema 版本变化（meta.schema 对不上）时强制全量重建，保证新增字段不会漏补。
+
+语言字段：每份文档在提取后做一次**文档级**语言判定，把 lang / cjk_ratio 盖到该文档
+的所有 chunk 上，并由 lang 派生 zh_text（中文文档=原文，英文文档=空）——这是检索侧
+字段级语言路由的摄入期准备，见 ADR-010。
 """
 
 import hashlib
@@ -27,6 +33,7 @@ import numpy as np
 from app.rag import config
 from app.rag.chunker import SUPPORTED_SUFFIXES, TextBlock, chunk_text, extract_document
 from app.rag.keyword_store import ElasticsearchUnavailable, keyword_store
+from app.rag.language import classify_document
 from app.rag.vector_store import QdrantUnavailable, vector_store
 
 logger = logging.getLogger(__name__)
@@ -116,8 +123,21 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
 
     # 读取上次的文件哈希清单；force 或首次摄入时视为空
     old_files: dict[str, str] = {}
+    old_doc_langs: dict[str, dict] = {}
     if meta_path.exists() and not force:
-        old_files = json.loads(meta_path.read_text(encoding="utf-8")).get("files", {})
+        old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        old_files = old_meta.get("files", {})
+        old_doc_langs = old_meta.get("doc_langs", {})
+        # 索引 schema 升级（如 v2 新增 lang / cjk_ratio / zh_text）时旧索引字段不全，
+        # 而文件内容哈希没变——仅凭哈希会判成「无变化」，新字段永远补不上，
+        # 检索侧的字段路由就会拿不到 zh_text 而静默失效。故直接转全量重建。
+        if old_meta.get("schema") != config.INDEX_SCHEMA_VERSION:
+            logger.info(
+                "检测到索引 schema 变更（%s → %s），本次改为全量重建",
+                old_meta.get("schema"),
+                config.INDEX_SCHEMA_VERSION,
+            )
+            force = True
 
     # 增量跳过前先校验后端数据完整性：文档没变、但某个后端（Qdrant / ES）的文档数
     # 与本地原文索引对不上时，说明上次摄入半途失败或后端数据卷被清空——此时仅凭文件
@@ -133,18 +153,47 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
     if not doc_files:
         raise FileNotFoundError(f"知识库 {kb_name} 中没有可摄入的文档: {kb_dir}")
 
+    # 先算一遍各文件哈希：既要判断增量，也要在发现文档被修改/删除时提前转全量
+    current_hashes = {str(p.relative_to(kb_dir)): _file_sha256(p) for p in doc_files}
+
+    # 文档被修改或删除时无法安全增量：修改会留下旧 chunk 对应的孤儿向量/ES 文档，
+    # 删除更是无从按增量清理。这两种情况一律转全量重建（规模小，代价可接受）；
+    # 只有「纯新增文档」才走增量追加路径。
+    if not force:
+        modified = {n for n, h in current_hashes.items() if n in old_files and old_files[n] != h}
+        deleted = set(old_files) - set(current_hashes)
+        if modified or deleted:
+            logger.info(
+                "检测到文档变更或删除（%s），本次改为全量重建以保证索引一致",
+                "、".join(sorted(modified | deleted)),
+            )
+            force = True
+
     unchanged_files: dict[str, str] = {}
+    doc_langs: dict[str, dict] = {}  # 每份文档的语言判定结果，落 meta 便于观测与调阈值
     chunks: list[dict] = []
     for doc_path in doc_files:
-        file_hash = _file_sha256(doc_path)
         rel_name = str(doc_path.relative_to(kb_dir))
-        if rel_name in old_files and old_files[rel_name] == file_hash and not force:
+        file_hash = current_hashes[rel_name]
+        if not force and rel_name in old_files and old_files[rel_name] == file_hash:
             unchanged_files[rel_name] = file_hash
             continue
         blocks: list[TextBlock] = extract_document(doc_path)
+        # 语言判定在**文档级**做：合并全文算一次，再传给切分器统一盖章。
+        # 块级判定会被英文报告里的中文碎片块带偏（见 app/rag/language.py）
+        doc_lang, doc_cjk_ratio = classify_document("\n".join(b.text for b in blocks))
+        doc_langs[rel_name] = {"lang": doc_lang, "cjk_ratio": doc_cjk_ratio}
         # block_index 参与 chunk id 构造，保证同标题的多个块之间 id 也不冲突
         for block_index, block in enumerate(blocks, start=1):
-            chunks.extend(chunk_text(block, rel_name, block_index=block_index))
+            chunks.extend(
+                chunk_text(
+                    block,
+                    rel_name,
+                    block_index=block_index,
+                    doc_lang=doc_lang,
+                    doc_cjk_ratio=doc_cjk_ratio,
+                )
+            )
         unchanged_files[rel_name] = file_hash
 
     # 哈希全部一致且未强制重建：无需任何写入
@@ -158,10 +207,33 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
             "keyword": None,  # 未变更，本次没有写 ES
         }
 
-    # 落盘原文：一次性重写（知识库规模小，全量重建比合并补丁简单可靠）
-    # 这份文件是 BM25 路的唯一数据源，也是向量 payload 的 seq 对齐基准
+    # 落盘原文。这份文件是 BM25 路的唯一数据源，也是 Qdrant / ES 的 seq 对齐基准——
+    # seq 就是行号，所以**增量追加时既有行必须原样保留在原位置**（行号不能变），
+    # 否则既有向量/关键词点的 seq 会指到别的 chunk 上，检索命中后取到错误原文。
     chunks_path = index_dir / "chunks.jsonl"
+
+    # 本次要（重新）处理的文档：正常情况下其旧 chunk 不在文件里（新增文档本就没有）；
+    # 这层过滤是为了兜住「chunks.jsonl 已写、meta.json 未及更新时进程中断」的窗口，
+    # 避免同一文档下一轮被当成新增再追加一次。此类行只可能出现在文件尾部
+    # （新文档总是追加在末尾），因此剔除它们不会移动其它文档的行号。
+    processed_docs = {name for name in current_hashes if name not in unchanged_files}
+    retained_lines: list[str] = []
+    if not force and chunks_path.exists():
+        with open(chunks_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    if json.loads(line).get("doc") in processed_docs:
+                        continue
+                except json.JSONDecodeError:
+                    pass  # 保留无法解析的行，宁可留着也不打乱行号
+                retained_lines.append(line)
+    seq_offset = len(retained_lines)
+
     with open(chunks_path, "w", encoding="utf-8") as f:
+        for line in retained_lines:
+            f.write(line if line.endswith("\n") else line + "\n")
         for chunk in chunks:
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
@@ -172,7 +244,7 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         try:
             if force:
                 vector_store.delete_kb(kb_name)
-            vector_store.upsert(kb_name, chunks, vectors)
+            vector_store.upsert(kb_name, chunks, vectors, seq_offset=seq_offset)
         except QdrantUnavailable as e:
             raise RuntimeError(
                 f"向量写入 Qdrant 失败，请确认向量库已启动（{config.QDRANT_URL}）: {e}"
@@ -187,7 +259,7 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         try:
             if force:
                 keyword_store.delete_kb(kb_name)
-            es_docs = keyword_store.index_kb(kb_name, chunks)
+            es_docs = keyword_store.index_kb(kb_name, chunks, seq_offset=seq_offset)
         except ElasticsearchUnavailable as e:
             logger.warning(
                 "ES 关键词索引写入跳过（%s），关键词路将回退进程内 BM25: %s",
@@ -201,6 +273,7 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         stale_vectors.unlink()
 
     meta = {
+        "schema": config.INDEX_SCHEMA_VERSION,
         "files": unchanged_files,
         "vector_enabled": config.EMBEDDING_ENABLED,
         "vector_store": "qdrant" if config.EMBEDDING_ENABLED else "",
@@ -210,6 +283,13 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         "keyword_store": "elasticsearch" if es_docs else "local-bm25",
         "es_index": config.ES_INDEX if es_docs else "",
         "es_docs": es_docs,
+        # 每份文档的语言判定结果：增量摄入时新文档覆盖同名旧条目，未变更文档沿用上次结果；
+        # 已被删除的文档条目在此过滤掉，避免 meta 里留下幽灵文档
+        "doc_langs": {
+            name: lang
+            for name, lang in {**old_doc_langs, **doc_langs}.items()
+            if name in current_hashes
+        },
         "chunk_size": config.CHUNK_SIZE,
         "chunk_overlap": config.CHUNK_OVERLAP,
         "ingested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -220,7 +300,9 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         "kb": kb_name,
         "updated": True,
         "docs": len(doc_files),
-        "chunks": len(chunks),
+        # 报告本次索引后的总 chunk 数（增量时含未变更文档的既有 chunk），与三处 count 对齐
+        "chunks": seq_offset + len(chunks),
+        "new_chunks": len(chunks),
         "vector": config.EMBEDDING_ENABLED,
         "keyword": bool(es_docs),
     }
@@ -290,7 +372,13 @@ if __name__ == "__main__":
         else:
             keyword_status = "回退本地 rank-bm25"
         vector_status = "已索引" if item["vector"] else "未启用"
+        new_chunks = item.get("new_chunks")
+        if status == "已更新" and new_chunks is not None and new_chunks != item["chunks"]:
+            # 增量追加：既有 chunk 未重算，单独标出本次真正新增的量
+            chunk_info = f"chunk {item['chunks']} 条（本次新增 {new_chunks}）"
+        else:
+            chunk_info = f"chunk {item['chunks']} 条"
         print(
-            f"[{item['kb']}] {status} | 文档 {item['docs']} 份 | chunk {item['chunks']} 条\n"
+            f"[{item['kb']}] {status} | 文档 {item['docs']} 份 | {chunk_info}\n"
             f"    关键词路(ES): {keyword_status} | 向量路(Qdrant): {vector_status}"
         )
