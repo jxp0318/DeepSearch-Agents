@@ -8,6 +8,9 @@ search_knowledge_base 对指定知识库执行双路检索，返回原始片段�
 与原 RAGFlow 工具的本质区别：这里返回的是**检索到的原文片段**，由子智能体
 自行阅读、筛选并综合成回答；而不是把问题转发给外部 Chat 服务拿现成答案。
 检索（R）与生成（G）分离，子智能体就是那个 G。
+
+检索走 retriever 的**生产模式 hybrid_rerank**（双路 RRF 融合 + cross-encoder 精排，
+见 ADR-012）；精排不可用时 retriever 内部自动退化为纯 RRF，工具层无需感知。
 """
 
 from typing import Annotated
@@ -54,6 +57,7 @@ def search_knowledge_base(
 
     返回内容为知识库文档中的原始片段（含来源文档与章节定位），不是现成答案。
     请基于片段内容自行综合回答，并在回答中注明信息来自哪份文档。
+    检索走 retriever 的生产模式 hybrid_rerank（双路 RRF 融合 + cross-encoder 精排）。
     :param kb_name: 知识库名称
     :param query: 检索问题
     :param top_k: 返回片段数

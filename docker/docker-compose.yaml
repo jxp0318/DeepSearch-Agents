@@ -16,10 +16,16 @@
 #                与 Qdrant 对称——Qdrant 存向量、ES 存原文倒排索引
 #   kibana       可选可视化（profile: kibana），按需启动：
 #                docker compose --env-file .env -f docker/docker-compose.yaml --profile kibana up -d kibana
+#   reranker     精排 cross-encoder（bge-reranker-v2-m3，profile: rerank），按需启动：
+#                docker compose --env-file .env -f docker/docker-compose.yaml --profile rerank up -d reranker
+#                模型文件需放在 docker/reranker/bge-reranker-v2-m3/（约 2.2GB，不入 git）
 #
 # 降级行为：embedding / qdrant / elasticsearch 任一未启动时，检索自动降级——
 # ES 不可达则关键词路回退进程内 rank_bm25，Qdrant 不可达则向量路缺席，
 # 最差情况仍有纯关键词检索可用，不影响系统其余功能。
+# reranker 容器是早期 TEI 形态，已被**进程内 ONNX 精排**取代（ADR-012）：生产检索
+# 走 reranker.py 的 CUDA 推理，不依赖本服务。保留仅作回顾对照与离线实验，
+# 需要时 --profile rerank 启动即可。
 
 name: deepsearch-agents
 
@@ -149,6 +155,54 @@ services:
     depends_on:
       elasticsearch:
         condition: service_healthy
+
+  reranker:
+    # 精排层（cross-encoder）：把融合后的候选池逐对重排。
+    # 效果已验证（阶段 0，39 查询）：Recall@5 59.3% → 84.3%，跨语言组提升最大。
+    #
+    # ⚠️ 本机（纯 CPU + candle 后端）三个已知限制，务必了解：
+    #   1) 慢——每个候选约 400ms 线性累加，深度 15（池约 21 条）单查询重排约 8.8s；
+    #   2) 不稳——TEI candle CPU 后端持续压测下约每 10 个请求 SIGSEGV 崩一次
+    #      （core/src/queue.rs:87 队列 bug，可复现）；
+    #   3) 崩溃会连带 Docker Desktop 的 WSL2 VM 一起崩，WSL 为每次崩溃在
+    #      %LOCALAPPDATA%\Temp\wsl-crashes\ 写一份 ~3GB 内存转储（实测 3 次 = 9.5GB，
+    #      曾把 C 盘吃到只剩 2.8G）。批量压测后请检查并清理该目录。
+    # 因此 restart 用有限次的 on-failure:5，而非 unless-stopped——避免崩溃后无限重启、
+    # 无限写转储。
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    platform: linux/amd64
+    container_name: deepsearch-reranker
+    profiles: ["rerank"]
+    restart: "on-failure:5"
+    command:
+      - "--json-output"
+      - "--auto-truncate"
+      - "--tokenization-workers"
+      - "4"
+      - "--max-client-batch-size"
+      - "32"
+    ports:
+      # 对应 .env 的 RERANKER_URL=http://localhost:8082/rerank
+      - "${RERANKER_PORT:-8082}:80"
+    environment:
+      MODEL_ID: /models/bge-reranker-v2-m3
+      # CPU 上并发再高会互相争抢，反而更慢；8 是实测可用值
+      MAX_CONCURRENT_REQUESTS: "8"
+      # ⚠️ 关键：8192 会在 warmup 阶段 OOM（Exit 137），必须保持 4096。
+      # 元凶是 warmup 的激活内存，不是模型本体（2.2G fp32）；常驻约 2.9~3.0 GiB。
+      MAX_BATCH_TOKENS: "4096"
+      # candle CPU 后端的推理线程数
+      RAYON_NUM_THREADS: "8"
+    volumes:
+      # 模型目录随项目走，不依赖外部路径；已在 .gitignore 排除
+      - ./reranker/bge-reranker-v2-m3:/models/bge-reranker-v2-m3:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      # 2.2GB fp32 模型在 CPU 上冷启动很慢，给足预热窗口
+      start_period: 300s
 
 volumes:
   deepsearch_mysql_data:
