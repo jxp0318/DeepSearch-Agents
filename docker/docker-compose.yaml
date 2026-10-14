@@ -8,9 +8,10 @@
 #
 # 服务都是「可选」的，缺任何一个系统仍能跑：
 #   mysql        业务数据信源（未启动时数据库查询助手不可用）
-#   embedding    自建 RAG 的向量化后端（见 ADR-006）：HuggingFace text-embeddings-inference
-#                加载 bge-large-zh-v1.5，提供原生 /embed 与 OpenAI 兼容的 /v1/embeddings（1024 维）。
-#                模型文件需放在 docker/embedding/bge-large-zh-v1.5/（约 1.3GB，不入 git）
+#   embedding    自建 RAG 的向量化后端（见 ADR-006 / ADR-015）：HuggingFace text-embeddings-inference
+#                **GPU 版**镜像加载 bge-m3，提供原生 /embed 与 OpenAI 兼容的 /v1/embeddings（1024 维）。
+#                模型文件需放在 .workbuddy/models/bge-m3/（约 2.2GB，不入 git）。
+#                GPU 需 Docker Desktop 已注册 nvidia-container-runtime（本机已通）。
 #   qdrant       向量库（见 ADR-007）：存放 chunk 向量，与关键词路组成双路检索
 #   elasticsearch 关键词检索路（见 ADR-008）：自建镜像装 IK 中文分词，
 #                与 Qdrant 对称——Qdrant 存向量、ES 存原文倒排索引
@@ -32,7 +33,7 @@ name: deepsearch-agents
 services:
   mysql:
     image: mysql:8.4
-    container_name: deepsearch-mysql
+    container_name: ds-mysql
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-root}
@@ -64,36 +65,51 @@ services:
       start_period: 30s
 
   embedding:
-    # CPU 版推理镜像；本地已有该镜像时不会重新拉取（约 938MB）
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    # 生产向量模型 = bge-m3（568M / 24 层 / vocab 250k，XLM-RoBERTa，1024 维，CLS pooling）。
+    # 2026-10-12 由 bge-large-zh-v1.5 切换而来：「中→英」跨语言召回向量层 Rec@5 33.3%→66.7%
+    # （离线探针，见 docs/eval-testset-v3.md §7.10）。同为 1024 维 ⇒ Qdrant collection 无需变更。
+    # GPU 版推理镜像（tag `1.8` = 通用 CUDA 版，覆盖 Ada/sm_89，即本机 RTX 4060）。
+    # 2026-10-12 由 cpu-1.8 换而来：CPU 推理实测仅 ~1 块/秒（2367 块要 40 分钟），
+    # 换 GPU 后同样的重编码降到分钟级。**换的是引擎不是模型**——bge-m3 权重不动。
+    image: ghcr.io/huggingface/text-embeddings-inference:1.8
     platform: linux/amd64
-    container_name: deepsearch-embedding
+    container_name: ds-embedding
     restart: unless-stopped
-    command: ["--json-output"]
+    command: ["--json-output", "--pooling", "cls", "--auto-truncate", "--tokenization-workers", "4"]
     ports:
       # 对应 .env 的 EMBEDDING_BASE_URL=http://localhost:8081/v1
       - "${EMBEDDING_PORT:-8081}:80"
     environment:
-      MODEL_ID: /models/bge-large-zh-v1.5
-      # bge-large-zh-v1.5 最大输入 512 token，超长会返回 413；
-      # 摄入侧已把 chunk 控制在 400 字符以内，此处保持默认不自动截断便于暴露配置问题
-      MAX_CONCURRENT_REQUESTS: "16"
-      MAX_BATCH_TOKENS: "16384"
+      MODEL_ID: /models/bge-m3
+      # ⚠️ CPU 时代的约束：16384 / 4096 都在 warmup 阶段 OOM（Exit 137）——元凶是**主机 RAM**
+      # （Docker VM 仅 7.6 GiB）里那份 4096 token 的注意力矩阵。换 GPU 后激活张量落在显存，
+      # 主机内存不再是瓶颈，故放宽到 4096（配合自动截断，480 字符的块永不触发截断）。
+      # 若显存吃紧（评测时 reranker 也要 ~3GB），可回落到 2048。
+      MAX_CONCURRENT_REQUESTS: "8"
+      MAX_BATCH_TOKENS: "4096"
     volumes:
-      # 模型目录随项目走，不依赖任何外部项目；文件较大，已在 .gitignore 中排除
-      - ./embedding/bge-large-zh-v1.5:/models/bge-large-zh-v1.5:ro
+      # 模型目录在 .workbuddy/models/（已 gitignore，不入 git；.workbuddy 不删）
+      - ../.workbuddy/models/bge-m3:/models/bge-m3:ro
+    # 把宿主 GPU 透给容器（Docker Desktop 已注册 nvidia-container-runtime）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:80/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 20
-      # 1.3GB 模型在 CPU 上冷启动需要较长时间，给足预热窗口
+      # 568M 模型在 CPU 上冷启动需要较长时间，给足预热窗口
       start_period: 300s
 
   qdrant:
     # 向量库（见 ADR-007）：chunk 向量的持久化与相似度检索
     image: qdrant/qdrant:v1.16
-    container_name: deepsearch-qdrant
+    container_name: ds-qdrant
     restart: unless-stopped
     ports:
       # 6333 = REST API + Web dashboard（http://localhost:6333/dashboard）
@@ -114,7 +130,7 @@ services:
     # 自建镜像只做一件事——把 analysis-ik 插件装进去（插件包随仓库提供，构建不联网）
     build: ./elasticsearch
     image: deepsearch-elasticsearch:8.19.10
-    container_name: deepsearch-elasticsearch
+    container_name: ds-elasticsearch
     restart: unless-stopped
     environment:
       discovery.type: single-node
@@ -141,7 +157,7 @@ services:
     # 可选可视化：ES 的数据浏览与检索调试（对应 Qdrant 自带的 dashboard）
     # 默认不启动，需要时用 --profile kibana 显式开启（镜像约 2.1GB）
     image: kibana:8.19.10
-    container_name: deepsearch-kibana
+    container_name: ds-kibana
     profiles: ["kibana"]
     restart: unless-stopped
     environment:
@@ -171,7 +187,7 @@ services:
     # 无限写转储。
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     platform: linux/amd64
-    container_name: deepsearch-reranker
+    container_name: ds-reranker
     profiles: ["rerank"]
     restart: "on-failure:5"
     command:

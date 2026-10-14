@@ -23,11 +23,19 @@ KNOWLEDGE_BASE_ROOT = PROJECT_ROOT / "docs" / "knowledge_base"
 
 # 原文索引目录：每个知识库一个子目录，含 chunks.jsonl（chunk 原文）与 meta.json（索引模式）
 # 向量不在这里，存放在 Qdrant（见 ADR-007）
-INDEX_ROOT = PROJECT_ROOT / "app" / "rag" / "indexes"
+#
+# 可被环境变量 RAG_INDEX_ROOT 覆盖：做**解析器 A/B 对照**时把对照臂的索引写到独立目录，
+# 生产索引保持不动（对照臂用不同的解析器与切块结果，混进同一目录会互相覆盖）。
+INDEX_ROOT = Path(os.getenv("RAG_INDEX_ROOT") or (PROJECT_ROOT / "app" / "rag" / "indexes"))
 
-# 切分参数：面向中文报告类文档的经验值
-# 上限由 embedding 模型决定：bge-large-zh-v1.5 的最大输入是 512 token，中文约 1 token/字，
-# 因此目标块长度压到 400 字符以内留足余量（600 字符实测会被 TEI 以 413 拒绝）
+# 后端（Qdrant / ES）的库名后缀：Qdrant 是「单 collection + payload.kb 过滤」、
+# ES 是「单索引 + 字段 kb 过滤」，两侧都靠 kb 值隔离库。对照臂若沿用同一 kb 值，
+# 两臂的向量与关键词点会混在同一个库里互相污染，故用后缀把它们分开。
+KB_BACKEND_SUFFIX = os.getenv("RAG_KB_SUFFIX", "").strip()
+
+# 目标块长度：报告类中文文档的经验值。原为适配 bge-large-zh-v1.5 的 512 token 上限而定
+# （中文约 1 token/字，600 字符实测会被 TEI 以 413 拒绝）；现役 bge-m3 上限 8192、已非约束，
+# 但保持 400 不变，以免改动既有 chunk 切分与评测题库的 gold 口径
 CHUNK_SIZE = 400          # 目标块长度（字符），中文约 200~300 token
 CHUNK_OVERLAP = 80         # 相邻块重叠字符数，保证跨块语义不断裂
 
@@ -40,17 +48,44 @@ DEFAULT_TOP_K = 5          # 工具默认返回片段数
 
 # 索引 schema 版本：chunk 字段结构变更时递增，旧索引会被自动转为全量重建（见 ingest）。
 # v2 新增 lang / cjk_ratio / zh_text 三个字段（字段级语言路由，见 ADR-010）
-INDEX_SCHEMA_VERSION = 2
+# v3 新增 page_index / page_label / section_path / chunk_type / table / content_hash /
+#    parser_version / needs_ocr；同时 PDF 的 block_index 语义从「页码」升级为「节序号」
+#    ——这是一次不兼容变更，v2 索引必须整库重建（见 docs/pdf-parsing-plan.md §3）
+INDEX_SCHEMA_VERSION = 3
+
+# PDF 解析器选择（⑦ 切换开关）：
+#   layout  —— 自研版面解析链路（app/rag/pdf_parser.py：分栏/页眉页脚/页码双轨/标题多信号/
+#              表格独立成块/按节切块），产出 schema v3 chunk，是**当前生产默认**
+#   chunker —— 旧链路（pypdf 按页提取 + chunker.chunk_text），保留作回退与 A/B 对照
+# 只影响 PDF。
+PDF_PARSER = os.getenv("PDF_PARSER", "layout").strip().lower()
+
+# 非 PDF 文档（docx / md / txt / pptx / html）解析器选择：
+#   struct  —— 统一结构化解析链路（app/rag/struct_parser.py）：各格式先转成统一中间
+#              表示（标题 / 正文 / 表格），再按与 PDF 完全相同的契约产出 schema v3
+#              chunk——section_path / chunk_type / table 都是**真值**。**当前默认**。
+#   chunker —— 旧链路（chunker.extract_document + chunk_text）：非 PDF 的结构字段只能
+#              补中性默认值（section_path=[] / chunk_type 恒为 body / table=None），
+#              且 docx 的表格（document.tables）**不会被读取**——表格内容会整块丢失。
+#              保留作回退与 A/B 对照。
+STRUCT_PARSER = os.getenv("STRUCT_PARSER", "struct").strip().lower()
+
+# 自研 PDF 解析器版本号：写进每个 chunk 的 parser_version，便于回溯与 A/B 对比
+# 0.4.0 新增无框线多列表的「列网格重建」（pdf_layout.table_grid_lines，带三重门禁）
+PARSER_VERSION = "layout-0.4.0"
+
+# 统一结构化解析器版本号（非 PDF 文档）：同样是 chunk 级 parser_version，
+# 与 PDF 的 PARSER_VERSION 区分开，便于观测「这份块是哪条链路产的」
+STRUCT_PARSER_VERSION = "struct-0.1.0"
 
 # 语言判定阈值（见 app/rag/language.py 与 ADR-010）。均为**先验值、未做校准实验**，
 # 设计目标是「不误杀」而非最优：真正的隔离由 zh_text 字段完成，阈值只管路由决策。
 LANG_DOC_ZH_MIN_RATIO = 0.20      # 文档级：全文汉字占比 ≥ 此值判中文
-LANG_QUERY_ZH_MIN_RATIO = 0.30    # 查询级：≥ 此值判中文
-LANG_QUERY_EN_MAX_RATIO = 0.02    # 查询级：≤ 此值判英文；两者之间判中英混排
+LANG_QUERY_ZH_MIN_RATIO = 0.30    # 查询级：≥ 此值判中文，其余判中英混排
 
 # embedding 端点（OpenAI 兼容 /embeddings 协议）。三项齐全才启用向量检索；
 # 缺任一项时检索层自动降级为纯 BM25，并通过 meta.json 记录当前索引模式。
-# 推荐后端：本地 TEI 服务（HuggingFace text-embeddings-inference）加载 bge-large-zh-v1.5，
+# 推荐后端：本地 TEI 服务（HuggingFace text-embeddings-inference，**GPU 版镜像**）加载 bge-m3，
 # 它同时提供原生 /embed 与 OpenAI 兼容的 /v1/embeddings，后者可直接对接本模块。
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "").rstrip("/")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
@@ -110,8 +145,29 @@ RERANK_MODEL_DIR = Path(
 )
 # 执行提供器偏好：auto（CUDA 优先、CPU 兜底）| cuda（只要 CUDA）| cpu
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "auto").strip().lower()
-# 单次前向的候选批大小：GPU 上批越大越省 kernel launch，但显存与队列延迟同增
-RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "16"))
+# ONNX 权重子目录：auto（默认，有 onnx_fp16/ 就用它、否则回退 onnx/）| onnx | onnx_fp16
+#
+# fp16 权重由 docker/reranker/export_onnx_fp16.py 从 fp32 的 onnx/ 转换而来（权重减半、
+# Ada 上 fp16 吞吐翻倍）。2026-10-13 端到端 A/B（60 查询，K=25 每路）：精排 P50
+# 592ms → 295ms、端到端 P50 707ms → 402ms，而 ★Rec@5 / NDCG@5 / AP@5 / MRR@5
+# 与 ▲逐条 60 条查询**完全相同**（0/60 变化），logits 最大绝对差 0.0057。
+# 因此默认走 auto：有 fp16 就用（快一倍），没有就静默用 fp32（不报错、不降级）。
+# 想强制某一种时显式设 RERANK_ONNX_SUBDIR=onnx 或 onnx_fp16。
+RERANK_ONNX_SUBDIR = os.getenv("RERANK_ONNX_SUBDIR", "auto").strip() or "auto"
+# 单次前向的候选批大小
+#
+# ⚠️ 反直觉但已实测（2026-10-13，RTX 4060 Laptop，app/eval/bench_rerank.py）：**批越小越快**。
+# K=25 时候选中位耗时 bs=4 → 330ms、bs=8 → 363ms、bs=16 → 447ms、bs=25 → 493ms。
+# 原因是 cross-encoder 是 transformer，单序列注意力 O(L²)，而 `_encode` 要把一批里
+# 所有序列补齐到**该批最长**——长表格块会把同批的短正文块一起抬到 260 token。
+# 因此 (1) 批不宜大，(2) 更要紧的是配合 RERANK_LENGTH_SORTED 按长度排序切批。
+RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "8"))
+# 切批前是否按序列长度升序排序（见 reranker._batch_plan）。这是上面那条实测的直接产物：
+# 排序后每批内长度接近，padding 浪费最小。置 False 可复现「原序切批」的对照臂。
+# 它**不改变分数与排名**（逐对打分，与计算顺序无关），只改变同一批里的邻居。
+RERANK_LENGTH_SORTED = os.getenv("RERANK_LENGTH_SORTED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 # 精排用的每路候选深度（0 = 沿用 top_k×3）。生产取 25：见 ADR-013 深池重测——
 # 15→25 用 +0.16s 换 +2.7pt Recall@5，是性价比拐点；再往上耗时近似线性增长
 # （精排成本对候选数线性、单候选 ≈14ms 恒定，GPU 也不例外），而质量只多 1~2pt。
@@ -120,6 +176,44 @@ RERANK_CANDIDATE_K = int(os.getenv("RERANK_CANDIDATE_K", "25"))
 # query+chunk 拼接后的 token 上限（XLM-R 硬上限 512）；chunk 已控制在 400 字符内，
 # 正常不会触发截断，留作防御
 RERANK_MAX_LENGTH = int(os.getenv("RERANK_MAX_LENGTH", "512"))
+
+# 扫描页 OCR（C4 的实现端）——见 app/rag/ocr.py
+# 只对 detect_scanned_pages 检出 needs_ocr 的页做 OCR，把架构图 / 信息图 / 位图表格里
+# **提取不到**的文字补回检索链路（实测样本：具身智能 p15 架构图，PyMuPDF 仅提出 38 字符）。
+# 引擎用 rapidocr-onnxruntime（PP-OCR 系列，纯 onnx，模型随 wheel 内置、离线可用）。
+# 三态：auto（默认，装了引擎才启用）/ 1 强制尝试 / 0 关闭。引擎缺失时静默降级，
+# 扫描页仍带 needs_ocr 标记入库，不影响整体摄入。
+OCR_ENABLED = os.getenv("OCR_ENABLED", "auto").strip().lower()
+OCR_DISABLED = OCR_ENABLED in {"0", "false", "no", "off"}
+# 渲染 dpi：识别率与耗时的折中。150 实测单页 ~3s、A4 → 1240×1754；
+# 提到 200 耗时 +25% 而识别行数几乎不变（位图表格 79 → 78 行），故默认 150。
+OCR_DPI = int(os.getenv("OCR_DPI", "150"))
+# 行置信度下限：低于此值的行丢弃，滤掉水印 / 装饰噪声
+OCR_MIN_SCORE = float(os.getenv("OCR_MIN_SCORE", "0.5"))
+
+
+def rerank_onnx_subdir() -> str:
+    """
+    解析 ``RERANK_ONNX_SUBDIR``：``auto`` 时优先 fp16，没有该目录则回退 fp32
+
+    解析结果同时用于「模型文件是否存在」的前置检查与建模，所以两条路天然一致——
+    不会出现「检查 fp32、加载 fp16」这种错位。
+    """
+    if RERANK_ONNX_SUBDIR != "auto":
+        return RERANK_ONNX_SUBDIR
+    if (RERANK_MODEL_DIR / "onnx_fp16" / "model.onnx").exists():
+        return "onnx_fp16"
+    return "onnx"
+
+
+def backend_kb(kb_name: str) -> str:
+    """
+    把「本地索引目录名」映射为「Qdrant / ES 里的 kb 值」
+
+    生产环境后缀为空，映射是恒等变换；做解析器对照时设 ``RAG_KB_SUFFIX``（如
+    ``__docling``），两臂在同一 collection / 索引里各占一份互不可见的 kb 分区。
+    """
+    return f"{kb_name}{KB_BACKEND_SUFFIX}"
 
 
 def list_knowledge_base_names() -> list[str]:

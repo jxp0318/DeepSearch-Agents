@@ -20,6 +20,11 @@ rank-1，跨语言时还会被「假公共 token」污染。离线评测已量�
 - 分词用 `tokenizers` 直接读 `tokenizer.json`——与 `transformers.AutoTokenizer`
   编码逐位一致（pad id 取 `<pad>`），但导入 0.03s vs 14.8s，不值得为一行便利拖
   一个 transformers+torch 进来。
+- **批量推理 + 按长度排序切批**：候选一次性编码后**先按序列长度升序排再按
+  `RERANK_BATCH_SIZE` 切批**，每批一次 `session.run`（不是 Python 循环逐篇调用）。
+  排序的理由是 padding：`_encode` 把一批补齐到该批最长，而 cross-encoder 的注意力
+  是 O(L²)，长短混排（900 字符表格块 + 200 字符正文块）时大批会把短块一起抬长——
+  实测 K=25 下 bs=25 比 bs=4 慢 1.5×。排序**不改变任何分数与排名**，只换批内邻居。
 - **懒加载**：模型 2.2GB，只有第一次真正调用精排时才建 session。
 - **可降级**：模型缺失、依赖未装、CUDA 不可用或推理抛错，`rerank()` 一律返回
   `None`，调用方（Retriever）保持 RRF 原序并告警一次——检索永远不会因为精排而失败。
@@ -60,8 +65,12 @@ class Reranker:
 
     @property
     def onnx_path(self) -> Path:
-        """ONNX 权重入口（optimum-cli 导出产物；大权重在旁边的 model.onnx_data）"""
-        return self.model_dir / "onnx" / "model.onnx"
+        """ONNX 权重入口（optimum-cli 导出产物；大权重在旁边的 model.onnx_data）
+
+        子目录由 ``config.rerank_onnx_subdir()`` 决定：``auto``（默认）在存在
+        ``onnx_fp16/`` 时优先半精度（快一倍、指标一致），否则回退 ``onnx/``（fp32）。
+        """
+        return self.model_dir / config.rerank_onnx_subdir() / "model.onnx"
 
     def _precheck_fail(self) -> str:
         """不建 session 的前置检查，返回失败原因（空串 = 通过）"""
@@ -119,7 +128,8 @@ class Reranker:
             return False
         try:
             names = {i.name for i in self._session.get_inputs()}
-            self._session.run(None, self._encode("预热", ["预热"], names))
+            encs = self._tokenizer.encode_batch([("预热", "预热")])
+            self._session.run(None, self._encode(encs, [0], names))
         except Exception as e:  # noqa: BLE001 —— 哑推理只为预热，失败不影响可用性
             logger.debug("精排预热推理失败（不影响可用性）：%s", e)
         return True
@@ -188,7 +198,8 @@ class Reranker:
         self._pad_id = int(pad_id)
         self._provider = active[0] if active else "?"
         self._loaded = True
-        logger.info("精排就绪：provider=%s，模型=%s", self._provider, self.onnx_path.name)
+        logger.info("精排就绪：provider=%s，权重=%s",
+                    self._provider, f"{config.rerank_onnx_subdir()}/model.onnx")
 
     @staticmethod
     def _provider_chain() -> list[str]:
@@ -275,11 +286,12 @@ class Reranker:
         input_names = {i.name for i in self._session.get_inputs()}
 
         try:
-            for start in range(0, len(texts), bs):
-                chunk = texts[start : start + bs]
-                feed = self._encode(query, chunk, input_names)
+            # 先整体编码一次，再按**长度升序**分批（见 _batch_plan 的说明）。
+            encodings = self._tokenizer.encode_batch([(query, t) for t in texts])
+            for idxs in self._batch_plan(encodings, bs):
+                feed = self._encode(encodings, idxs, input_names)
                 logits = self._session.run(None, feed)[0]
-                scores[start : start + len(chunk)] = self._sigmoid(logits).reshape(-1)
+                scores[idxs] = self._sigmoid(logits).reshape(-1)
         except Exception as e:  # noqa: BLE001 —— 单次推理失败同样降级
             if not self._load_failed:
                 logger.warning("精排推理失败，本次查询保持 RRF 原序：%s: %s", type(e).__name__, e)
@@ -290,13 +302,35 @@ class Reranker:
         order = np.argsort(scores)[::-1]
         return [(int(i), float(scores[i])) for i in order]
 
-    def _encode(self, query: str, texts: list[str], input_names: set[str]) -> dict:
-        """query+chunk 拼成对，编码成规整矩阵（按最长序列 padding）"""
-        encodings = self._tokenizer.encode_batch([(query, t) for t in texts])
-        width = max(len(e.ids) for e in encodings)
-        input_ids = np.full((len(encodings), width), self._pad_id, dtype=np.int64)
-        attention_mask = np.zeros((len(encodings), width), dtype=np.int64)
-        for row, enc in enumerate(encodings):
+    @staticmethod
+    def _batch_plan(encodings: list, bs: int) -> list[list[int]]:
+        """
+        分批方案：**先按序列长度升序排，再按 bs 切**（返回每批的原下标）
+
+        为什么必须按长度排：`_encode` 会把一批里所有序列**补齐到该批最长**，而
+        cross-encoder 是 transformer，单序列注意力是 O(L²)——padding 不是免费的。
+        原下标顺序切批时，一条 260 token 的长块能把同批其他 7 条短块一起抬到 260；
+        候选池恰好是「长短混杂」（表格块 900+ 字符 / 正文块 200 字符），实测
+        K=25 下 bs=25（一批补齐全部）比 bs=4（每批各自补齐）慢 **1.5×**
+        （492ms vs 330ms，RTX 4060 Laptop，见 app/eval/bench_rerank.py）。
+        排序后每批内的长度高度接近，padding 浪费被压到最小；**分数与排名不受影响**
+        （逐对打分，与计算顺序无关），只是同一批里的邻居换了。
+
+        注意它**不改变 batch 数**（仍是 ceil(n/bs) 批）——收益全部来自 padding 减少。
+        """
+        if config.RERANK_LENGTH_SORTED:
+            order = sorted(range(len(encodings)), key=lambda i: len(encodings[i].ids))
+        else:
+            order = list(range(len(encodings)))
+        return [order[i : i + bs] for i in range(0, len(order), bs)]
+
+    def _encode(self, encodings: list, idxs: list[int], input_names: set[str]) -> dict:
+        """把选中的 (query, chunk) 对排成规整矩阵（按本批最长 padding）"""
+        picked = [encodings[i] for i in idxs]
+        width = max(len(e.ids) for e in picked)
+        input_ids = np.full((len(picked), width), self._pad_id, dtype=np.int64)
+        attention_mask = np.zeros((len(picked), width), dtype=np.int64)
+        for row, enc in enumerate(picked):
             n = len(enc.ids)
             input_ids[row, :n] = enc.ids
             attention_mask[row, :n] = 1

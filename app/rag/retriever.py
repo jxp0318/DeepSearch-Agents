@@ -12,7 +12,7 @@
 
 **字段级语言路由**（ADR-010）：关键词路的正文有两个字段——`text`（原文）与
 `zh_text`（中文可检索视图，英文文档为空）。查询先判语言，中文 query 只打
-`zh_text`、英文 query 只打 `text`、混排 query 两个都打。这样「中文 query ×
+`zh_text`、混排 query 两个都打（2026-10-12 起纯英文查询已下线）。这样「中文 query ×
 英文库」时关键词路天生拿不到候选，融合自动退化为向量单路——RRF 的双路命中
 奖励在失效路存在时反而会拖低排名（实测中文组 Recall@5 46.2% → 69.2%）。
 库内语言与查询语言完全不匹配时，整路直接跳过，既省一次 ES 查询也更干净。
@@ -38,6 +38,7 @@ cross-encoder 精排（进程内 ONNX，见 app/rag/reranker.py）。RRF 只看�
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,9 +154,15 @@ class Retriever:
         query: str,
         top_k: int | None = None,
         mode: str = PRODUCTION_MODE,
-    ) -> tuple[list[dict], list[int]]:
+        trace: bool = False,
+    ):
         """
         与 search 完全相同的检索，但额外返回**截断前**的候选池序号列表
+
+        ``trace=True`` 时再追加一份**只读**的中间排名快照（向量腿 / 关键词腿 / RRF 精排前
+        / 精排后）与 ``keyword_status``，供评测诊断「miss 发生在召回层还是排序层」。快照
+        全部取自**本次检索的真实中间结果**，不额外发起检索、不改变排序或截断行为；
+        ``trace=False`` 时返回值与历史完全一致（``(results, pool_seqs)`` 二元组）。
 
         候选池 = 两路各取 candidate_k（缺省 top_k×3）后 RRF 融合去重的集合。rerank
         只能在这个集合内重排，故「候选池召回」是 Recall@5 的理论上限——评测用它量化
@@ -165,6 +172,10 @@ class Retriever:
         所以池成员与是否精排无关，池召回上限也保持不变。
         """
         top_k = top_k or config.DEFAULT_TOP_K
+        if trace:
+            fused, trace_out = self._fused_ranking(kb_name, query, top_k, mode, trace=True)
+            return (self._materialize(kb_name, fused[:top_k]),
+                    [seq for seq, _ in fused], trace_out)
         fused = self._fused_ranking(kb_name, query, top_k, mode)
         return self._materialize(kb_name, fused[:top_k]), [seq for seq, _ in fused]
 
@@ -196,21 +207,34 @@ class Retriever:
         mode: str,
         candidate_k: int | None = None,
         apply_rerank: bool = True,
-    ) -> list[tuple[int, float]]:
-        """构建排序后的完整候选池（**不截断**），search / search_with_pool / candidate_pool 共用"""
+        trace: bool = False,
+    ):
+        """构建排序后的完整候选池（**不截断**），search / search_with_pool / candidate_pool 共用
+
+        ``trace=True`` 时**追加**返回一份只读的中间排名快照（向量腿 / 关键词腿 / RRF 精排前
+        / 精排后）与 ``keyword_status``——用于定位 miss 到底发生在召回层还是排序层。快照
+        全部取自本次检索的真实中间结果，**不额外发起检索、不改变任何排序 / 截断行为**；
+        ``trace=False`` 时返回单一 list，与历史完全一致。
+        """
         top_k = top_k or config.DEFAULT_TOP_K
         # hybrid_rerank 的融合部分与 hybrid 完全一致，只是融合后再精排一次——
         # 这样「精排 vs 不精排」的差异纯粹来自精排，不受融合行为变化干扰
         fusion_mode = "hybrid" if mode == "hybrid_rerank" else mode
         index = self._load_index(kb_name)
-        if not index.chunks:
-            return []
-
         # 查询语言决定关键词路打哪个字段（字段级路由，见 ADR-010）：
         # zh → 只打 zh_text（英文文档的块天生不在候选里）
-        # en → 只打 text
         # mixed → 两个正文字段都打
+        # （纯英文查询已于 2026-10-12 下线，classify_query 不再返回 "en"）
         query_lang = classify_query(query)
+        if not index.chunks:
+            if not trace:
+                return []
+            return [], {
+                "query_lang": query_lang, "fusion_mode": fusion_mode, "candidate_k": 0,
+                "keyword_applicable": False, "keyword_status": "no_index",
+                "vector_seqs": [], "keyword_seqs": [], "rrf_seqs": [], "rerank_seqs": None,
+                "t_fusion_ms": 0.0, "t_rerank_ms": 0.0, "t_total_ms": 0.0,
+            }
         keyword_applicable = self._keyword_route_applicable(index, query_lang)
 
         # 两路候选各取 cand_k（缺省 3 倍 top_k），给 RRF 融合留足交集空间。
@@ -222,14 +246,24 @@ class Retriever:
             cand_k = config.RERANK_CANDIDATE_K
         else:
             cand_k = top_k * 3
+
+        # 耗时埋点：perf_counter 无副作用，故 trace=False 时也照跑（成本 ~50ns），
+        # 但它**只在 trace 出口暴露**——生产路径的返回值与行为一字未改。
+        t_retrieval_start = time.perf_counter()
+
         rankings: list[list[tuple[int, float]]] = []
+        # 命名保留两路原始排名（仅 trace 用；不参与融合计算，故不影响行为）
+        vector_ranking: list[tuple[int, float]] | None = None
+        keyword_ranking: list[tuple[int, float]] | None = None
         if fusion_mode in ("hybrid", "keyword") and keyword_applicable:
-            rankings.append(
-                self._keyword_search_safe(kb_name, index, query, cand_k, query_lang)
+            keyword_ranking = self._keyword_search_safe(
+                kb_name, index, query, cand_k, query_lang
             )
+            rankings.append(keyword_ranking)
         if fusion_mode == "bm25":
             # 仅进程内 BM25：评测对照用，用于量化「ES 关键词路」相对手写实现的增益
-            rankings.append(self._bm25_search(index, query, cand_k))
+            keyword_ranking = self._bm25_search(index, query, cand_k)
+            rankings.append(keyword_ranking)
         if fusion_mode in ("hybrid", "vector"):
             vector_ranking = self._vector_search_safe(kb_name, query, cand_k)
             if vector_ranking:
@@ -241,12 +275,52 @@ class Retriever:
             # - keyword 模式：该模式的语义就是「只看关键词路」，路由判不适用时空集才对
             # - 关键词路已被语言路由判定为不适用（中文 query × 纯英文库）：此时退回 BM25
             #   等于把噪声重新灌回来，返回空结果才是正确答案
-            rankings.append(self._bm25_search(index, query, cand_k))
+            keyword_ranking = self._bm25_search(index, query, cand_k)
+            rankings.append(keyword_ranking)
 
-        fused = self._rrf_fuse(*rankings)
+        pre_rerank = self._rrf_fuse(*rankings)
+        # ① 召回 + RRF 融合：两路检索（含 query embedding 的 HTTP 往返）到融合出池为止
+        t_fusion_ms = (time.perf_counter() - t_retrieval_start) * 1000
+        fused = pre_rerank
+        reranked: list[tuple[int, float]] | None = None
+        # ② 精排单独耗时（本模式无精排时恒为 0，语义上 = 没有这一环）
+        t_rerank_ms = 0.0
         if mode == "hybrid_rerank" and apply_rerank:
+            t_rerank_start = time.perf_counter()
             fused = self._rerank_order(kb_name, query, fused)
-        return fused
+            t_rerank_ms = (time.perf_counter() - t_rerank_start) * 1000
+            reranked = fused
+        # ③ 本层总耗时（①+②+排序整理；不含调用方的 _materialize 取原文）
+        t_total_ms = (time.perf_counter() - t_retrieval_start) * 1000
+
+        if not trace:
+            return fused
+
+        # keyword_status：区分「被语言路由跳过」「执行了但空手而归」「召回成功」
+        if keyword_ranking is None:
+            keyword_status = (
+                "skipped_by_router"
+                if fusion_mode in ("hybrid", "keyword") and not keyword_applicable
+                else "not_in_mode"
+            )
+        else:
+            keyword_status = "found" if keyword_ranking else "searched_not_found"
+
+        return fused, {
+            "query_lang": query_lang,
+            "fusion_mode": fusion_mode,
+            "candidate_k": cand_k,
+            "keyword_applicable": keyword_applicable,
+            "keyword_status": keyword_status,
+            "vector_seqs": [s for s, _ in (vector_ranking or [])],
+            "keyword_seqs": [s for s, _ in (keyword_ranking or [])],
+            "rrf_seqs": [s for s, _ in pre_rerank],
+            "rerank_seqs": ([s for s, _ in reranked] if reranked is not None else None),
+            # 耗时拆解（毫秒）：① 召回+RRF 融合 / ② 精排单独 / ③ 本层合计
+            "t_fusion_ms": t_fusion_ms,
+            "t_rerank_ms": t_rerank_ms,
+            "t_total_ms": t_total_ms,
+        }
 
     def _rerank_order(
         self, kb_name: str, query: str, fused: list[tuple[int, float]]
@@ -306,7 +380,10 @@ class Retriever:
         try:
             from app.rag.keyword_store import ElasticsearchUnavailable, keyword_store
 
-            return keyword_store.search(kb_name, query, k, query_lang=query_lang)
+            # 后端 kb 值可能与本地目录名不同（对照臂带 RAG_KB_SUFFIX），见 config.backend_kb
+            return keyword_store.search(
+                config.backend_kb(kb_name), query, k, query_lang=query_lang
+            )
         except ElasticsearchUnavailable as e:
             if not self._keyword_degraded:
                 logger.warning("ES 关键词检索不可用，已回退进程内 BM25: %s", e)
@@ -352,7 +429,7 @@ class Retriever:
             from app.rag.vector_store import QdrantUnavailable, vector_store
 
             query_vector = self._embed_query(query)
-            return vector_store.search(kb_name, query_vector, k)
+            return vector_store.search(config.backend_kb(kb_name), query_vector, k)
         except QdrantUnavailable as e:
             if not self._vector_degraded:
                 logger.warning("向量检索不可用，已降级为纯 BM25: %s", e)

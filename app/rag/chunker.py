@@ -22,8 +22,22 @@ from pathlib import Path
 
 from app.rag.config import CHUNK_OVERLAP, CHUNK_SIZE
 
-# 支持摄入的文档后缀（知识库目录里暂时只有 PDF，其余格式为前瞻支持）
-SUPPORTED_SUFFIXES = {".pdf", ".docx", ".md", ".txt"}
+# 支持摄入的文档后缀
+# - .pdf                          → 自研版面解析（app/rag/pdf_parser.py，PDF_PARSER=layout）
+# - .docx/.md/.txt/.pptx/.html    → 统一结构化解析（app/rag/struct_parser.py，STRUCT_PARSER=struct）
+# 下面的旧提取函数（_extract_docx / _extract_markdown）只在回退路径上使用：
+# PDF_PARSER != layout，或 STRUCT_PARSER=chunker（非 PDF 的结构字段只能补默认值、
+# 且 docx 的表格内容会丢失，故不再是默认路径）。
+SUPPORTED_SUFFIXES = {
+    ".pdf",
+    ".docx",
+    ".md",
+    ".markdown",
+    ".txt",
+    ".pptx",
+    ".html",
+    ".htm",
+}
 
 
 @dataclass
@@ -36,10 +50,14 @@ class TextBlock:
 
 def extract_document(file_path: Path) -> list[TextBlock]:
     """
-    提取单个文档，返回按章节组织的文本块列表
+    【回退路径】提取单个文档，返回按章节组织的文本块列表
+
+    默认链路已改为：PDF 走 ``pdf_parser``、非 PDF 走 ``struct_parser``（两者都产出
+    schema v3 全字段）。本函数仅在 ``PDF_PARSER != layout`` 或 ``STRUCT_PARSER=chunker``
+    时被调用，用于对照与快速回退。
 
     - PDF：按页提取，每页一个块（页是 PDF 能拿到的最可靠结构单元）
-    - DOCX：按段落提取，heading 样式的段落视为章节标题
+    - DOCX：按段落提取，heading 样式的段落视为章节标题（**不读 document.tables**）
     - Markdown：按 # 标题切节
     - TXT：整体作为一个块
     :param file_path: 文档路径
@@ -241,6 +259,25 @@ def chunk_text(
         chunk["cjk_ratio"] = doc_cjk_ratio
         chunk["zh_text"] = chunk["text"] if doc_lang == "zh" else ""
     return chunks
+
+
+def split_text(text: str) -> list[str]:
+    """
+    把一段文本按句子边界切成目标长度的片段（供自研 PDF 解析器复用）
+
+    切分逻辑与 ``chunk_text`` 完全一致（超长按句下钻、单句仍超长时硬切、相邻片段
+    保留 ``CHUNK_OVERLAP`` 重叠），只是返回**纯文本**而非 chunk 字典——自研 PDF
+    链路的元数据字段比旧链路多，由 ``app/rag/pdf_parser.py`` 自行组装。
+
+    :param text: 待切分文本
+    :return: 片段列表（空文本返回空列表）
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= CHUNK_SIZE:
+        return [text]
+    return [chunk["text"] for chunk in _split_long_text(text, "", "")]
 
 
 def _split_long_text(text: str, source_doc: str, heading: str) -> list[dict]:

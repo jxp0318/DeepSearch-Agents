@@ -17,7 +17,8 @@
    rank_bm25，知识库能力不消失（抛 ElasticsearchUnavailable 交由上层处理）。
 5. **按查询语言路由检索字段**（ADR-010）：正文有两个可检索字段——`text`（原文）与
    `zh_text`（中文可检索视图，英文文档为空）。中文 query 只打 `zh_text`，跨语言时
-   关键词路自然出空而不是把噪声块混进融合结果；同语言时增益完全保留。
+   关键词路自然出空而不是把噪声块混进融合结果；同语言时增益完全保留。中英混排
+   query 两个字段都打。（2026-10-12 起纯英文查询已下线，故不再有 en 字段组。）
 """
 
 from __future__ import annotations
@@ -44,12 +45,12 @@ _FALLBACK_ANALYZER = "standard"      # ES 内置：中文按字切分，效果�
 # - zh：只打 zh_text——即中文文档的原文。英文文档的 zh_text 为空，其块天生不进候选，
 #   关键词路在跨语言场景下整体退出，检索退化为向量单路（实测最优行为：中文 query
 #   在纯英文库上 Recall@5 从原始 RRF 的 46.2% 恢复到 69.2%）
-# - en：只打 text（英文原文）+ heading
 # - mixed：两个正文字段都打——混排 query 带英文 token，实测确实需要关键词路
 #   （混合组 Recall@5：关键词路参与 69.9% vs 纯向量 55.1%）
+# **2026-10-12 起纯英文查询已下线**（英→中 / 英→英 不再支持），移除原 en 字段组；
+# 可见字段的基础是 zh_text，mixed 在其上追加 text / heading。
 _SEARCH_FIELDS_BY_LANG = {
     "zh": ["zh_text^1.0"],
-    "en": ["text^1.0", "heading^2.0"],
     "mixed": ["text^1.0", "zh_text^1.0", "heading^2.0"],
 }
 
@@ -264,14 +265,14 @@ class ElasticsearchKeywordStore:
 
         用 multi_match 覆盖正文与章节标题（标题权重 2 倍），打分由 ES 内置 BM25 给出。
         **检索字段由查询语言决定**（见 ADR-010）：中文 query 只打 zh_text，
-        英文 query 只打 text，混排 query 两个都打。英文文档的 zh_text 为空，
-        故中文 query 在英文文档上命中为空——跨语言时关键词路自然退出，
+        混排 query 两个正文字段都打（2026-10-12 起纯英文查询已下线）。英文文档的
+        zh_text 为空，故中文 query 在英文文档上命中为空——跨语言时关键词路自然退出，
         而不是靠事后过滤噪声块（过滤只能剔掉显眼碎片，实测只恢复到 15%）。
 
         :param kb_name: 知识库名
         :param query: 检索问题
         :param limit: 返回条数
-        :param query_lang: 查询语言，"zh" | "en" | "mixed"，由调用方（retriever）判定后传入
+        :param query_lang: 查询语言，"zh" | "mixed"，由调用方（retriever）判定后传入
         :return: [(chunk 在 chunks.jsonl 中的行号, 相关度得分)]，按得分降序
         :raises ElasticsearchUnavailable: ES 不可达，调用方应回退本地 BM25
         """

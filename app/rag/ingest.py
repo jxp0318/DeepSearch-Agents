@@ -5,8 +5,11 @@
 索引按知识库组织，三处存储（见 ADR-007 / ADR-008）：
 
     app/rag/indexes/<kb_name>/chunks.jsonl   每个 chunk 一行 JSON
-                                             （id / doc / heading / text / lang / cjk_ratio / zh_text）
-    app/rag/indexes/<kb_name>/meta.json      文件哈希清单与索引模式，用于增量摄入与降级标记
+                                             （id / doc / heading / text / lang / cjk_ratio / zh_text
+                                              + page_index / page_label / section_path / chunk_type /
+                                              table / content_hash / parser_version / needs_ocr；
+                                              chunk_type ∈ {body, table, ocr}，其中 ocr = 扫描页 OCR 产物）
+    app/rag/indexes/<kb_name>/meta.json      文件哈希清单、索引模式、文档级 page_map，用于增量摄入与降级标记
     Qdrant collection (payload.kb = <kb_name>)   chunk 向量
     ES 索引 (字段 kb = <kb_name>)                chunk 原文与元数据（IK 分词倒排索引）
 
@@ -20,6 +23,17 @@ chunks.jsonl 始终是原文权威副本：embedding 未配置则不写向量，
 语言字段：每份文档在提取后做一次**文档级**语言判定，把 lang / cjk_ratio 盖到该文档
 的所有 chunk 上，并由 lang 派生 zh_text（中文文档=原文，英文文档=空）——这是检索侧
 字段级语言路由的摄入期准备，见 ADR-010。
+
+PDF 解析器选择（⑦ 切换）：`config.PDF_PARSER == "layout"`（默认）时 PDF 走自研版面解析
+链路（`app/rag/pdf_parser.py`，见 docs/pdf-parsing-plan.md ③~⑥），产出 schema v3 全字段
+chunk；设为 `"chunker"` 则回退旧的 pypdf 按页提取链路。
+
+非 PDF 解析器选择：`config.STRUCT_PARSER == "struct"`（默认）时 docx / md / txt / pptx /
+html 走统一结构化解析链路（`app/rag/struct_parser.py`）——各格式先转成统一的中间表示
+（标题 / 正文 / 表格），再按**与 PDF 相同的契约**产出 schema v3 全字段 chunk：
+`section_path` / `chunk_type` / `table` 都是真值，`page_index` / `page_label` 留空
+（这些格式没有"页"的概念）。设为 `"chunker"` 则回退旧提取链路，并由 `_v3_defaults`
+补上中性默认值——注意旧链路**不读 docx 的 `document.tables`，表格内容会整块丢失**。
 """
 
 import hashlib
@@ -105,6 +119,51 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
     return np.array(all_vectors, dtype=np.float32)
 
 
+def _pdf_text_for_language(pdf_path: Path) -> str:
+    """
+    快速取 PDF 全文纯文本，**仅用于文档级语言判定**
+
+    为什么不复用解析器产物：自研链路需要 ``doc_lang`` 作为输入（英文文档才启用
+    「全大写」标题信号），而语言判定又需要全文——形成先有鸡还是先有蛋。这里用
+    PyMuPDF 的纯文本提取（不做 span 聚类 / 线框解析）先跑一遍拿到全文，成本远低于
+    完整解析，摄入期一次性开销可忽略。
+    """
+    import pymupdf
+
+    document = pymupdf.open(str(pdf_path))
+    try:
+        return "\n".join(page.get_text() for page in document)
+    finally:
+        document.close()
+
+
+# 统一结构化解析器产出的 chunk 用 config.STRUCT_PARSER_VERSION（struct-*）；
+# 这里的版本号只给**回退路径**（PDF_PARSER != layout 或 STRUCT_PARSER=chunker）用
+_CHUNKER_PARSER_VERSION = "chunker-1.0.0"
+
+
+def _v3_defaults(chunk: dict) -> dict:
+    """
+    给**回退链路**的 chunk 补齐 schema v3 字段的**中性默认值**（就地修改并返回）
+
+    默认链路的两个解析器（pdf_parser / struct_parser）产出的这些字段都是真值；
+    补默认值只为保证 chunks.jsonl 内字段齐整，下游读 ``page_index`` /
+    ``section_path`` 时不必到处 ``.get`` 兜底。
+    """
+    chunk.setdefault("page_index", None)
+    chunk.setdefault("page_label", None)
+    chunk.setdefault("section_path", [])
+    chunk.setdefault("chunk_type", "body")
+    chunk.setdefault("table", None)
+    chunk.setdefault("parser_version", _CHUNKER_PARSER_VERSION)
+    chunk.setdefault("needs_ocr", False)
+    if not chunk.get("content_hash"):
+        chunk["content_hash"] = hashlib.sha256(
+            chunk.get("text", "").encode("utf-8")
+        ).hexdigest()[:16]
+    return chunk
+
+
 def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
     """
     摄入单个知识库：提取 → 切分 → 落盘原文 → 写向量库(Qdrant) + 写关键词索引(ES)
@@ -124,10 +183,14 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
     # 读取上次的文件哈希清单；force 或首次摄入时视为空
     old_files: dict[str, str] = {}
     old_doc_langs: dict[str, dict] = {}
+    old_page_maps: dict[str, dict] = {}
+    old_doc_parsers: dict[str, str] = {}
     if meta_path.exists() and not force:
         old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         old_files = old_meta.get("files", {})
         old_doc_langs = old_meta.get("doc_langs", {})
+        old_page_maps = old_meta.get("page_maps", {})
+        old_doc_parsers = old_meta.get("doc_parsers", {})
         # 索引 schema 升级（如 v2 新增 lang / cjk_ratio / zh_text）时旧索引字段不全，
         # 而文件内容哈希没变——仅凭哈希会判成「无变化」，新字段永远补不上，
         # 检索侧的字段路由就会拿不到 zh_text 而静默失效。故直接转全量重建。
@@ -171,6 +234,8 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
 
     unchanged_files: dict[str, str] = {}
     doc_langs: dict[str, dict] = {}  # 每份文档的语言判定结果，落 meta 便于观测与调阈值
+    doc_page_maps: dict[str, dict[str, str]] = {}  # 每份文档的 page_index → page_label（C5）
+    doc_parsers: dict[str, str] = {}  # 每份文档实际使用的解析器版本（三条链路各不相同）
     chunks: list[dict] = []
     for doc_path in doc_files:
         rel_name = str(doc_path.relative_to(kb_dir))
@@ -178,22 +243,72 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         if not force and rel_name in old_files and old_files[rel_name] == file_hash:
             unchanged_files[rel_name] = file_hash
             continue
-        blocks: list[TextBlock] = extract_document(doc_path)
-        # 语言判定在**文档级**做：合并全文算一次，再传给切分器统一盖章。
-        # 块级判定会被英文报告里的中文碎片块带偏（见 app/rag/language.py）
-        doc_lang, doc_cjk_ratio = classify_document("\n".join(b.text for b in blocks))
-        doc_langs[rel_name] = {"lang": doc_lang, "cjk_ratio": doc_cjk_ratio}
-        # block_index 参与 chunk id 构造，保证同标题的多个块之间 id 也不冲突
-        for block_index, block in enumerate(blocks, start=1):
-            chunks.extend(
-                chunk_text(
-                    block,
-                    rel_name,
-                    block_index=block_index,
-                    doc_lang=doc_lang,
-                    doc_cjk_ratio=doc_cjk_ratio,
+
+        # 单份文档解析失败**不应中断整库摄入**：解析器依赖第三方库（PyMuPDF / python-docx /
+        # python-pptx / python-ocr），一份损坏的文件不该让其余文档都入不了库。失败时记录
+        # 错误并**跳过该文档**——它不进 meta.files，下次摄入仍会被重试；解析中途已写入的
+        # 文档级状态（语言 / 页码映射 / 解析器版本）一并回滚，避免落成幽灵条目。
+        try:
+            suffix = doc_path.suffix.lower()
+            if suffix == ".pdf" and config.PDF_PARSER == "layout":
+                # ---- 自研版面解析链路（⑥ 组装 + ⑦ 切换）：产出 schema v3 全字段 chunk ----
+                from app.rag.pdf_parser import parse_document
+
+                # 语言判定在**文档级**做（见 app/rag/language.py）：先用纯文本提取拿全文，
+                # 再作为解析器输入（英文文档才启用「全大写」标题信号）
+                doc_lang, doc_cjk_ratio = classify_document(_pdf_text_for_language(doc_path))
+                doc_langs[rel_name] = {"lang": doc_lang, "cjk_ratio": doc_cjk_ratio}
+                parsed = parse_document(
+                    doc_path, rel_name, doc_lang=doc_lang, doc_cjk_ratio=doc_cjk_ratio
                 )
+                chunks.extend(parsed.chunks)
+                # page_map 是 C5 的文档级物理页 → 印刷页码映射，落 meta 供展示/溯源
+                doc_page_maps[rel_name] = {str(k): v for k, v in parsed.page_map.items()}
+                doc_parsers[rel_name] = config.PARSER_VERSION
+            elif suffix != ".pdf" and config.STRUCT_PARSER == "struct":
+                # ---- 统一结构化链路（docx / md / txt / pptx / html，见 ADR-017）----
+                # 各格式先转成统一中间表示，再按**与 PDF 完全相同的契约**产出 v3 chunk：
+                # section_path / chunk_type / table 都是真值（page_index 留空，这些格式
+                # 没有"页"的概念）。
+                from app.rag.struct_parser import assemble, blocks_text, extract_blocks
+
+                struct_blocks = extract_blocks(doc_path)
+                # 语言判定同样在**文档级**做：中间表示拼成全文算一次
+                doc_lang, doc_cjk_ratio = classify_document(blocks_text(struct_blocks))
+                doc_langs[rel_name] = {"lang": doc_lang, "cjk_ratio": doc_cjk_ratio}
+                chunks.extend(assemble(struct_blocks, rel_name, doc_lang, doc_cjk_ratio))
+                doc_parsers[rel_name] = config.STRUCT_PARSER_VERSION
+            else:
+                # ---- 旧链路回退：PDF 非 layout 模式，或 STRUCT_PARSER=chunker ----
+                # 非 PDF 走这里时结构字段只能补中性默认值（section_path=[] /
+                # chunk_type 恒为 body / table=None），且 docx 的表格内容会整块丢失。
+                blocks: list[TextBlock] = extract_document(doc_path)
+                # 语言判定在**文档级**做：合并全文算一次，再传给切分器统一盖章。
+                # 块级判定会被英文报告里的中文碎片块带偏（见 app/rag/language.py）
+                doc_lang, doc_cjk_ratio = classify_document("\n".join(b.text for b in blocks))
+                doc_langs[rel_name] = {"lang": doc_lang, "cjk_ratio": doc_cjk_ratio}
+                # block_index 参与 chunk id 构造，保证同标题的多个块之间 id 也不冲突
+                for block_index, block in enumerate(blocks, start=1):
+                    for chunk in chunk_text(
+                        block,
+                        rel_name,
+                        block_index=block_index,
+                        doc_lang=doc_lang,
+                        doc_cjk_ratio=doc_cjk_ratio,
+                    ):
+                        chunks.append(_v3_defaults(chunk))
+                doc_parsers[rel_name] = _CHUNKER_PARSER_VERSION
+        except Exception as exc:  # noqa: BLE001 —— 解析器可能抛任意第三方库异常
+            logger.error(
+                "文档解析失败，已跳过（该文档本次不会入库，其余文档照常处理）：%s | %s: %s",
+                rel_name,
+                type(exc).__name__,
+                exc,
             )
+            doc_langs.pop(rel_name, None)
+            doc_page_maps.pop(rel_name, None)
+            doc_parsers.pop(rel_name, None)
+            continue
         unchanged_files[rel_name] = file_hash
 
     # 哈希全部一致且未强制重建：无需任何写入
@@ -243,8 +358,10 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         vectors = _embed_texts([c["text"] for c in chunks])
         try:
             if force:
-                vector_store.delete_kb(kb_name)
-            vector_store.upsert(kb_name, chunks, vectors, seq_offset=seq_offset)
+                vector_store.delete_kb(config.backend_kb(kb_name))
+            vector_store.upsert(
+                config.backend_kb(kb_name), chunks, vectors, seq_offset=seq_offset
+            )
         except QdrantUnavailable as e:
             raise RuntimeError(
                 f"向量写入 Qdrant 失败，请确认向量库已启动（{config.QDRANT_URL}）: {e}"
@@ -258,8 +375,10 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
     if config.ES_ENABLED:
         try:
             if force:
-                keyword_store.delete_kb(kb_name)
-            es_docs = keyword_store.index_kb(kb_name, chunks, seq_offset=seq_offset)
+                keyword_store.delete_kb(config.backend_kb(kb_name))
+            es_docs = keyword_store.index_kb(
+                config.backend_kb(kb_name), chunks, seq_offset=seq_offset
+            )
         except ElasticsearchUnavailable as e:
             logger.warning(
                 "ES 关键词索引写入跳过（%s），关键词路将回退进程内 BM25: %s",
@@ -288,6 +407,24 @@ def ingest_knowledge_base(kb_name: str, force: bool = False) -> dict:
         "doc_langs": {
             name: lang
             for name, lang in {**old_doc_langs, **doc_langs}.items()
+            if name in current_hashes
+        },
+        # PDF 解析器标识 + 版本：便于区分新旧索引、做 A/B 与回溯（⑦）
+        "pdf_parser": config.PDF_PARSER,
+        "parser_version": config.PARSER_VERSION,
+        # 每份文档**实际**使用的解析器版本：PDF 走 layout-*、非 PDF 走 struct-*、
+        # 回退路径走 chunker-*。库级 parser_version 只代表 PDF 解析器，混合库
+        # （既有 PDF 又有 docx 等）必须看这张表才知道每份文档是谁解析的
+        "doc_parsers": {
+            name: version
+            for name, version in {**old_doc_parsers, **doc_parsers}.items()
+            if name in current_hashes
+        },
+        # 文档级 page_map（page_index → page_label，见 C5）：与 doc_langs 同样增量合并、
+        # 过滤掉已删除文档；未走自研链路的格式（docx/md/txt）没有页码映射，留空
+        "page_maps": {
+            name: mapping
+            for name, mapping in {**old_page_maps, **doc_page_maps}.items()
             if name in current_hashes
         },
         "chunk_size": config.CHUNK_SIZE,
@@ -339,17 +476,24 @@ def _backend_data_missing(kb_name: str, index_dir: Path) -> bool:
 
     if config.EMBEDDING_ENABLED:
         try:
-            if vector_store.count(kb_name) != expected:
+            if vector_store.count(config.backend_kb(kb_name)) != expected:
                 return True
         except QdrantUnavailable:
             pass
+        except Exception as exc:
+            # 连接层异常（Docker 未启动时的 502 / 超时等）同样按「不可达」处理：
+            # 本函数只判定「后端数据是否齐整」，服务没起来是另一回事，不该让摄入
+            # 崩在完整性校验上（见上方 docstring 的约定）。
+            logger.warning("向量库不可达，跳过完整性校验: %s", exc)
 
     if config.ES_ENABLED:
         try:
-            if keyword_store.count(kb_name) != expected:
+            if keyword_store.count(config.backend_kb(kb_name)) != expected:
                 return True
         except ElasticsearchUnavailable:
             pass
+        except Exception as exc:
+            logger.warning("关键词索引不可达，跳过完整性校验: %s", exc)
 
     return False
 
