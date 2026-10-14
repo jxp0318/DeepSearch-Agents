@@ -378,10 +378,6 @@ class ConnectionManager:
             del self.active_connections[thread_id]
         print(f"Client disconnected: {thread_id} (active={len(connections)})")
 
-    async def send_personal_message(self, message: str, websocket: WebSocket) -> None:
-        """向指定 WebSocket 发送纯文本消息"""
-        await websocket.send_text(message)
-
     async def send_to_thread(self, message: dict[str, Any], thread_id: str) -> None:
         """
         向指定 thread_id 下的所有前端连接广播 JSON 消息

@@ -7,6 +7,8 @@
 # Python
 .venv/
 venv/
+# Docling 对照臂的独立环境（已弃用、本地曾经存在，规则保留以防重建时误提交）
+.venv-docling/
 __pycache__/
 *.py[cod]
 *.pyo
@@ -24,12 +26,26 @@ frontend/.vite/
 # Runtime output and temporary files
 app/output/
 app/rag/indexes/
+# 解析器对照臂的独立索引根（Docling 臂，由 RAG_INDEX_ROOT 指定，见 docs/eval-docling-vs-layout.md）
+app/rag/indexes_docling/
 app/eval/results/
 tmp/
 *.log
 
 # Local research materials and test uploads
 docs/knowledge_base/
+
+# Agent 工作区：工作日志 / 开发脚本 / 本地备份 / 本地模型权重
+# 有意不纳入版本控制——体积大（bge-m3 权重 ~2.1GB，超 GitHub 单文件 100MB 上限）
+# 且属本地过程产物，不是交付物
+.workbuddy/
+
+# 本地研究材料与面试准备文档（有意不纳入版本控制）
+docs/PLAN.md
+docs/RAG-设计问答梳理.md
+docs/reflection-verification.md
+docs/interview/
+docs/pdf-parsing-*.md
 
 # Local embedding model files (docker/embedding/bge-large-zh-v1.5, ~1.3GB)
 docker/embedding/bge-large-zh-v1.5/
