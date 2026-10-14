@@ -30,24 +30,39 @@
 #             同一题的多个问句共享同一组 facts（锚点描述的是事实，与问句语言无关）
 #   facts     fact 级锚点：每个 fact 含一组 patterns，Top-k 拼接文本里任一 pattern
 #             出现即视为该事实被召回。patterns 为「或」关系，用于兼容原文的多种写法
+#   gold      chunk 级 gold（② 2026-10-11 新增）：该题标准答案应落在哪些 chunk 上，
+#             主键 = content_hash（v3 schema 字段，随文本稳定；**重切块后须重标**）。
+#             有 gold 的题，chunk 级指标（★Recall@5 / AP@5 / MRR@5 / NDCG@5）由 gold **真值**
+#             判定「相关块」；无 gold 的题回落到「含任一锚点即相关」的近似，报告里会标注。
 #   notes     校准说明（为什么用这个锚点、原文怎么写），不参与计算
+#
+# 锚点校准工具（铁律 #5 的自动化版本）：
+#   python -m app.eval.calibrate_retrieval [--write]
+#   对每个 pattern 统计当前索引里的命中 chunk 数与占比，标出 FAIL-0（0 命中）/
+#   WARN-BROAD（占比 >3%）/ WARN-CROSS（命中非答案文档）/ WARN-SPACE（双空格差异）。
+# chunk 级 gold 的生成/校验：
+#   python -m app.eval.build_gold [--check]
+#   打印可直接粘贴回本题库的 gold 块；--check 校验已有 gold 是否与当前索引一致
+#   （重切块后 hash 对不上会立刻报「gold 失效」，提示重标）。
 # ---------------------------------------------------------------------------
 
 cases:
-  # ===================== 新能源汽车出海 / ICCT（英文文档，380 chunk）=====================
+  # ===================== 新能源汽车出海 / ICCT（英文文档，schema v3 后 310 chunk）=====================
   - id: icct-q1
     kb: 新能源汽车出海
     doc: ICCT-Global-EV-Market-Monitor-2025.pdf
     doc_lang: en
     queries:
       zh: "2025年全球轻型电动汽车（LDV）的销量是多少？占新车总销量的比例是多少？"
-      en: "How many light-duty electric vehicles were sold globally in 2025, and what share of new LDV sales did they represent?"
       mixed: "2025年 global LDV 的 EV sales 是多少？占 new car sales 的 share 是多少？"
     facts:
       - name: 全球销量超2000万
         patterns: ["over 20 million"]
       - name: 占新LDV约25%
         patterns: ["about 25% of new LDVs"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p1/body fc3711e9dac519d8 ← 全球销量超2000万、占新LDV约25%
+    gold: [fc3711e9dac519d8]
 
   - id: icct-q2
     kb: 新能源汽车出海
@@ -55,7 +70,6 @@ cases:
     doc_lang: en
     queries:
       zh: "2025年纯电动汽车（BEV）的全球销量是多少？它在新电动车和新轻型车中分别占多大比例？"
-      en: "What were the global sales of battery electric vehicles (BEVs) in 2025, and what shares did they account for among new EVs and new LDVs?"
       mixed: "2025年 BEV（battery electric vehicle）的 global sales 是多少？占 new EVs 和 new LDVs 的比例分别多少？"
     facts:
       - name: BEV销量1400万
@@ -64,6 +78,9 @@ cases:
         patterns: ["67% of new EVs"]
       - name: 占新LDV 17%
         patterns: ["17% of new LDVs"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p1/body 6c2f06de2a0e7e3f ← BEV销量1400万、占新EV 67%、占新LDV 17%
+    gold: [6c2f06de2a0e7e3f]
 
   - id: icct-q3
     kb: 新能源汽车出海
@@ -71,7 +88,6 @@ cases:
     doc_lang: en
     queries:
       zh: "2025年中国的电动汽车销量、在全球市场中的占比，以及国内的电动车渗透率分别是多少？"
-      en: "What were China's EV sales in 2025, its share of the global EV market, and its domestic EV penetration rate?"
       mixed: "2025年 China 的 EV sales、它的 global market share，以及 domestic EV penetration 分别是多少？"
     facts:
       - name: 中国销量近1300万
@@ -80,6 +96,10 @@ cases:
         patterns: ["approximately 62%"]
       - name: 中国渗透率52%
         patterns: ["52% of new LDVs sold in the country"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p1/body 81166d51cd419c58 ← 占全球约62%
+    #   p2/body eedd1dd34cadd423 ← 中国销量近1300万、中国渗透率52%
+    gold: [81166d51cd419c58, eedd1dd34cadd423]
 
   - id: icct-q4
     kb: 新能源汽车出海
@@ -87,7 +107,6 @@ cases:
     doc_lang: en
     queries:
       zh: "2025年欧洲和美国的电动汽车销量及渗透率分别是多少？"
-      en: "What were the EV sales volumes and penetration rates in Europe and the United States in 2025?"
       mixed: "2025年 Europe 和 United States 的 EV sales 和 penetration rate 分别是多少？"
     facts:
       - name: 欧洲销量410万
@@ -98,6 +117,10 @@ cases:
         patterns: ["1.5 million EVs in 2025"]
       - name: 美国渗透率9%
         patterns: ["9% of all new LDVs"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p2/body eedd1dd34cadd423 ← 欧洲销量410万、欧洲渗透率27%
+    #   p2/body 7475dc4c4a0d617d ← 欧洲渗透率27%、美国销量150万、美国渗透率9%
+    gold: [eedd1dd34cadd423, 7475dc4c4a0d617d]
 
   - id: icct-q5
     kb: 新能源汽车出海
@@ -105,13 +128,17 @@ cases:
     doc_lang: en
     queries:
       zh: "2025年印度的电动汽车销量相比2024年增长了多少？渗透率是多少？"
-      en: "How much did India's EV sales grow in 2025 compared with 2024, and what was its EV penetration rate?"
       mixed: "2025年 India 的 EV sales 相比 2024 增长了多少？EV penetration 是多少？"
     facts:
       - name: 印度12.5万→20.2万
         patterns: ["125,000 in 2024 to 202,000 in 2025"]
       - name: 印度渗透率4%
         patterns: ["4% of new LDV sales"]
+    # gold: 1 个答案单元（2 块）—— 单元内命中任一即算命中，主键 = content_hash
+    #   [等价组] 以下块互为同一答案的等价出处，命中任一即算该单元命中：
+    #     p2/body 7475dc4c4a0d617d ← 印度12.5万→20.2万、印度渗透率4%
+    #     p2/body 48d18d3445ea22ec ← 印度12.5万→20.2万、印度渗透率4%
+    gold: [[7475dc4c4a0d617d, 48d18d3445ea22ec]]
 
   - id: icct-q6
     kb: 新能源汽车出海
@@ -119,7 +146,6 @@ cases:
     doc_lang: en
     queries:
       zh: "2025年新兴市场的电动汽车销量表现如何？哪个国家的电动车渗透率最高？"
-      en: "How did EV sales perform in emerging markets in 2025, and which country had the highest EV sales share?"
       mixed: "2025年 emerging markets 的 EV sales 表现如何？哪个国家 EV sales share 最高？"
     facts:
       - name: 新兴市场合计200万
@@ -128,6 +154,10 @@ cases:
         patterns: ["11 emerging markets sold approximately 1 million EVs"]
       - name: 越南渗透率最高37%
         patterns: ["Vietnam reached an EV sales share of 37%"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p2/body e35cf681211ab533 ← 新兴市场合计200万
+    #   p2/body f4c57c06ebe22101 ← 11个新兴市场约100万、越南渗透率最高37%
+    gold: [e35cf681211ab533, f4c57c06ebe22101]
 
   - id: icct-q7
     kb: 新能源汽车出海
@@ -135,7 +165,6 @@ cases:
     doc_lang: en
     queries:
       zh: "2025年中国、日本、韩国生产的电动汽车主要在国内销售还是出口？"
-      en: "In 2025, were EVs produced in China, Japan, and South Korea mainly sold domestically or exported?"
       mixed: "2025年 China、Japan、South Korea 生产的 EVs 主要是 sold domestically 还是 exported？"
     facts:
       - name: 中国生产87%内销
@@ -144,15 +173,87 @@ cases:
         patterns: ["Japan (70%)"]
       - name: 韩国56%出口
         patterns: ["South Korea (56%)"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p5/body dfc1cee57c6c88d7 ← 中国生产87%内销
+    #   p5/body a17520b3a1cb6bea ← 日本70%出口、韩国56%出口
+    gold: [dfc1cee57c6c88d7, a17520b3a1cb6bea]
 
-  # ===================== 金融行业 / 贝莱德（中文文档，76 chunk）=====================
+  # ============ 数值事实锚点（2026-10-11 新增，⑦ 切换前按 Plan §4 补齐）============
+  # 起因：Plan §4 指出——旧题库 44 查询 / 58 锚点**几乎全是文字事实**，完全没暴露
+  # 「pypdf 把图表数字解成字形名（/zero.tab /comma.tab …）」这条 20% 乱码。
+  # 以下锚点全部取自乱码最重的图表页（Figure 1 / 9 / 10），并逐条做了两件事：
+  #   1) 特异性校验：新索引内命中 chunk 数 = 1~2（≤0.7%），远低于 3% 阈值；
+  #   2) 反向校验：**在旧 pypdf 索引里命中 0** —— 数字当时被乱码吃掉，
+  #      所以这组锚点正是「乱码修复到底修好了没有」的直接证据（见
+  #      docs/pdf-parsing-step7.md 的锚点对照表）。
+  # 锚点形态刻意用「连续三个数值」的长组合（如 Volvo 的销售份额 / 纯电占比 / 市占），
+  # 单个百分比太泛，三连值既唯一又天然绑定了表格列语义。
+
+  - id: icct-q8
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年欧洲市场，Volvo、BMW 和大众集团（VW Group）的电动车销售份额（EV sales share）、其电动车中纯电（BEV）所占比例、以及它们各自的轻型车市场份额分别是多少？Tesla 在欧洲的轻型车市场份额是多少？"
+      mixed: "2025年欧洲市场 Volvo / BMW / VW Group 的 EV sales share、BEV 占比和 LDV market share 分别是多少？Tesla 在欧洲的 LDV market share 是多少？"
+    notes: "锚点取自 Figure 9（欧洲车企，物理页 12）。该页在旧 pypdf 索引里有 13 个乱码 chunk；三连值锚点在新索引命中 1 chunk、旧索引 0。"
+    facts:
+      - name: Volvo 销售份额 67.3% / BEV 占比 59.3% / 市占 2.5%
+        patterns: ["67.3% 59.3% 2.5%"]
+      - name: BMW 销售份额 41.5% / BEV 占比 64.6% / 市占 6.4%
+        patterns: ["41.5% 64.6% 6.4%"]
+      - name: 大众集团销售份额 29.6% / BEV 占比 66.2% / 市占 25.1%
+        patterns: ["29.6% 66.2% 25.1%"]
+      - name: Tesla 欧洲轻型车市占 1.6%
+        patterns: ["100.0% 100.0% 1.6%"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p12/body 891518995df1de69 ← Volvo 销售份额 67.3% / BEV 占比 59.3% / 市占 2.5%、BMW 销售份额 41.5% / BEV 占比 64.6% / 市占 6.4%、大众集团销售份额 29.6% / BEV 占比 66.2% / 市占 25.1%、Tesla 欧洲轻型车市占 1.6%
+    gold: [891518995df1de69]
+
+  - id: icct-q9
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "2025年美国市场，Volvo、梅赛德斯-奔驰（Mercedes-Benz）和 Stellantis 的电动车销售份额分别是多少？Nissan 的电动车中纯电（BEV）占比是多少？"
+      mixed: "2025年美国市场 Volvo / Mercedes-Benz / Stellantis 的 EV sales share 分别是多少？Nissan 的 BEV 占比是多少？"
+    notes: "锚点取自 Figure 10（美国车企，物理页 12）。同为三连值长组合，新索引命中 1~2 chunk、旧索引 0。"
+    facts:
+      - name: Volvo 美国销售份额 31.3% / BEV 占比 47.6% / 市占 0.8%
+        patterns: ["31.3% 47.6% 0.8%"]
+      - name: 奔驰美国销售份额 14.1% / BEV 占比 30.1% / 市占 2.1%
+        patterns: ["14.1% 30.1% 2.1%"]
+      - name: Stellantis 美国销售份额 10.5% / BEV 占比 15.7% / 市占 7.7%
+        patterns: ["10.5% 15.7% 7.7%"]
+      - name: Nissan 美国销量 6.9% / BEV 占比 100% / 市占 2.1%
+        patterns: ["6.9% 100.0% 2.1%"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p12/body 1da58af8203c0e6a ← Nissan 美国销量 6.9% / BEV 占比 100% / 市占 2.1%
+    #   p14/body 382707d5db000209 ← Volvo 美国销售份额 31.3% / BEV 占比 47.6% / 市占 0.8%、奔驰美国销售份额 14.1% / BEV 占比 30.1% / 市占 2.1%、Stellantis 美国销售份额 10.5% / BEV 占比 15.7% / 市占 7.7%
+    gold: [1da58af8203c0e6a, 382707d5db000209]
+
+  - id: icct-q10
+    kb: 新能源汽车出海
+    doc: ICCT-Global-EV-Market-Monitor-2025.pdf
+    doc_lang: en
+    queries:
+      zh: "Figure 1 展示的是 2015–2025 年全球轻型电动车年销量，它的纵轴最高刻度标到了多少辆？"
+      mixed: "Figure 1（2015–2025 global LDV EV sales）的纵轴最高刻度是多少辆？"
+    notes: "锚点取自 Figure 1 的纵轴刻度（物理页 1）。旧 pypdf 把整排刻度解成 /two.tab/five.tab/comma.tab… 乱码，数字全部丢失（该图所在页当时有 3 个乱码 chunk）；新索引命中 1 chunk、旧索引 0。"
+    facts:
+      - name: 纵轴最高刻度 2500 万辆
+        patterns: ["25,000,000"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p2/body 87a1666ee5467dfd ← 纵轴最高刻度 2500 万辆
+    gold: [87a1666ee5467dfd]
+
+  # ===================== 金融行业 / 贝莱德（中文文档，79 chunk）=====================
   - id: blk-q1
     kb: 金融行业
     doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
     doc_lang: zh
     queries:
       zh: "2026年全球投资展望中，人工智能建设的资本支出规模预计有多大？报告估算它能为经济额外创造多少收入？"
-      en: "In the 2026 Global Investment Outlook, how large is the projected capital expenditure on the AI buildout, and how much additional revenue does the report estimate it will create for the economy?"
       mixed: "2026 Global Investment Outlook 里，AI buildout 的 capex 预计多大？报告估算能额外创造多少 income？"
     facts:
       - name: 资本支出目标 5-8 万亿美元
@@ -161,6 +262,11 @@ cases:
         patterns: ["1.1万亿"]
       - name: 生产力贡献 1.5%
         patterns: ["1.5%"]
+    # gold: 最小覆盖集（3 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p4/body 32be619fe1f64a6a ← 资本支出目标 5-8 万亿美元
+    #   p6/body a87a974c097bff43 ← 生产力贡献 1.5%
+    #   p6/body 880be94a1009b2c0 ← 额外创造 1.1 万亿美元收入
+    gold: [32be619fe1f64a6a, a87a974c097bff43, 880be94a1009b2c0]
 
   - id: blk-q2
     kb: 金融行业
@@ -168,8 +274,11 @@ cases:
     doc_lang: zh
     queries:
       zh: "报告提出的三大投资主题分别是什么？"
-      en: "What are the three major investment themes proposed in the report?"
       mixed: "报告提出的三大 investment themes 分别是什么？"
+    notes: >-
+      三个主题名各命中 2~3 个 chunk（2.53%~3.80%）。「金融杠杆进行时」3.80% 略超 3% 阈值，
+      但三次命中都是同一主题名在摘要 / 目录 / 正文的正常复现，非跨主题假阳性；且本库只有 79 chunk，
+      同样 3 次命中在 310 chunk 的 ICCT 上只有 0.97%。故保留、并在报告中按「库内 chunk 数」解释阈值。
     facts:
       - name: 主题1 微观即宏观
         patterns: ["微观即宏观"]
@@ -177,6 +286,9 @@ cases:
         patterns: ["金融杠杆进行时"]
       - name: 主题3 分散投资的幻象
         patterns: ["分散投资的幻象"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p3/body 8d9c4dc252b60327 ← 主题1 微观即宏观、主题2 金融杠杆进行时、主题3 分散投资的幻象
+    gold: [8d9c4dc252b60327]
 
   - id: blk-q3
     kb: 金融行业
@@ -184,31 +296,44 @@ cases:
     doc_lang: zh
     queries:
       zh: "人工智能建设在美国面临哪些物理层面的制约？到2030年数据中心的电力需求预计达到什么程度？"
-      en: "What physical constraints does the AI buildout face in the US, and what level of data center power demand is expected by 2030?"
       mixed: "AI buildout 在美国面临哪些 physical constraints？到 2030 年 data center 的 power demand 预计多高？"
     facts:
       - name: 制约：算力与能源
         patterns: ["算力与能源", "物理层面的制约", "能源限制"]
       - name: 电力需求占四分之一
         patterns: ["四分之一"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p3/body 8d9c4dc252b60327 ← 制约：算力与能源
+    #   p9/body d216029bb10ba5ca ← 电力需求占四分之一
+    gold: [8d9c4dc252b60327, d216029bb10ba5ca]
 
   - id: blk-q4
     kb: 金融行业
     doc: 贝莱德BlackRock2026年全球投资展望报告17页.pdf
     doc_lang: zh
     queries:
-      zh: "报告对股票和固定收益资产给出的主要配置观点有哪些（美国股票、中国、日本、长期投资级别信用债）？"
-      en: "What are the report's main allocation views on equities and fixed income (US equities, China, Japan, long-term investment-grade credit)?"
-      mixed: "报告对 equities 和 fixed income 的主要 allocation views 是什么（US equities、China、Japan、long-term IG credit）？"
+      zh: "报告对股票和固定收益资产给出的主要配置观点有哪些（美国股票、中国债券、日本股票、长期投资级别信用债）？"
+      mixed: "报告对 equities 和 fixed income 的主要 allocation views 是什么（US equities、China bonds、Japan equities、long-term IG credit）？"
+    notes: >-
+      2026-10-11 重校 v2：原锚点「中国我们持中性观点」「长期投资级别信用债我们持低配观点」在 v3 索引里
+      0 命中——这两处落在 p16「战术配置细分观点」的**无框线并列双表**里。v3 的 group_lines 只按 y 合并、
+      不按 x 间隙切分，左右两张表的行被并成同一 Line，后续分栏判定失效 → 退回全局 y 排序 → 两表文本交错，
+      且资产名垂直居中会被插进评论句中（详见 docs/eval-attribution-v3.md）。
+      现锚点一律改取**在两种读法下都连续**的评论片段——锚点不应隐含「跨单元格相邻」这一解析属性，
+      那是解析层的评测对象，不是检索层。p16 的阅读顺序缺陷已单列为已知问题。
     facts:
       - name: 超配美国股票
         patterns: ["超配美国股票"]
-      - name: 中国持中性观点
-        patterns: ["中国我们持中性观点"]
+      - name: 中国债券可提供稳定性与分散投资价值
+        patterns: ["中国债券可提供稳定性与分散投资价值"]
       - name: 看好日本股票
         patterns: ["看好日本股票"]
       - name: 长期投资级别信用债低配
-        patterns: ["长期投资级别信用债我们持低配观点"]
+        patterns: ["我们持低配观点。相比长期债券"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p15/body 1ea846375cb99492 ← 超配美国股票、看好日本股票
+    #   p16/body 05e4bc9a3a0c92b8 ← 中国债券可提供稳定性与分散投资价值、长期投资级别信用债低配
+    gold: [1ea846375cb99492, 05e4bc9a3a0c92b8]
 
   - id: blk-q5
     kb: 金融行业
@@ -216,13 +341,16 @@ cases:
     doc_lang: zh
     queries:
       zh: "报告如何描述稳定币的兴起及其对金融体系的影响？"
-      en: "How does the report describe the rise of stablecoins and their impact on the financial system?"
       mixed: "报告如何描述 stablecoins 的兴起及对 financial system 的影响？"
     facts:
       - name: 稳定币是数字金融体系的结构性要素
         patterns: ["稳定币已成为数字金融体系的结构性要素"]
       - name: 与法定货币挂钩
         patterns: ["与法定货币"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p11/body 25476df508f6d1bc ← 与法定货币挂钩
+    #   p11/body 7078b3ef9a7db5d4 ← 稳定币是数字金融体系的结构性要素
+    gold: [25476df508f6d1bc, 7078b3ef9a7db5d4]
 
   - id: blk-q6
     kb: 金融行业
@@ -230,57 +358,66 @@ cases:
     doc_lang: zh
     queries:
       zh: "报告对新兴市场中的印度给出了什么配置建议？"
-      en: "What allocation recommendation does the report give for India in emerging markets?"
       mixed: "报告对 emerging markets 中的 India 给出了什么 allocation 建议？"
     facts:
       - name: 高于基准权重配置印度股票
         patterns: ["高于基准水平的权重配置印度股票"]
       - name: 人口结构是印度最核心优势
         patterns: ["人口结构是印度最核心"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p15/body cbb440c23d443fe6 ← 高于基准权重配置印度股票、人口结构是印度最核心优势
+    gold: [cbb440c23d443fe6]
 
   # ===================== 单语题（等对应知识库入库后可跑）=====================
   # 这几题的锚点锚在「人工智能产业」与「新能源汽车出海」的其他文档上。
   # 对应文档尚未重新入库时，eval_retrieval 会自动跳过并告警（不会当成 0 分计入）。
+  #
+  # 2026-10-11 状态：kb-06~10 全部跳过（文档未入库），**锚点未对当前索引校验过**，
+  # 下面 notes 里的「命中 x/y chunk」是更早一次大索引的旧数，不可当作当前校准结果。
+  # 待这 10 份 PDF 入库后再跑 `python -m app.eval.calibrate_retrieval` 重校并补 gold。
 
   - id: kb-06
     kb: 人工智能产业
     doc: 中国信通院-具身智能发展报告（2025年）.pdf
     doc_lang: zh
     queries:
-      zh: "中国信通院《具身智能发展报告（2025年）》中，截至 2025 年 12 月我国具身智能和机器人领域的投资事件数与融资总额分别是多少？报告把具身智能产品分为哪两类载体，各自要解决什么问题？"
-    notes: "锚点特异性已校验：744 → 3/2036 chunk、735.43 → 2、移动类 / 操作类 各 1，无假阳性风险"
+      zh: "中国信通院《具身智能发展报告（2025年）》中，截至 2025 年 12 月，我国具身智能和机器人领域的投资事件数是多少起？融资总额是多少亿元人民币？"
+      mixed: "截至 2025 年 12 月，我国 embodied AI 与 robotics 领域的 investment deals 有多少起？total funding 是多少亿元？"
+    notes: >-
+      原文 p4：「投资事件数达744 起，融资总额735.43 亿元人民币」（数字与量词间有 PDF 提取空格，
+      故锚点同时给带空格与不带空格两种写法）。2026-10-11 从原合题拆出「载体两分」（另立 kb-11）——
+      一题背 4 个事实时 top-5 只有 5 个槽位，实测「移动类 / 操作类」两条永远召不回。
     facts:
       - name: 投资事件数 744 起
-        patterns: ["744"]
+        patterns: ["744 起"]
       - name: 融资总额 735.43 亿元
         patterns: ["735.43"]
-      - name: 移动类载体（去哪里）
-        patterns: ["移动类"]
-      - name: 操作类载体（干什么）
-        patterns: ["操作类"]
+    # gold: 1 个答案单元（2 块）—— 单元内命中任一即算命中，主键 = content_hash
+    #   [等价组] 以下块互为同一答案的等价出处，命中任一即算该单元命中：
+    #     p4/body b57f7fb186b659e3 ← 投资事件数 744 起、融资总额 735.43 亿元
+    #     p12/body b520c4322a0485c5 ← 投资事件数 744 起、融资总额 735.43 亿元
+    gold: [[b57f7fb186b659e3, b520c4322a0485c5]]
 
   - id: kb-07
     kb: 人工智能产业
     doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
     doc_lang: zh
     queries:
-      zh: "斯坦福《2026 年人工智能指数报告》如何判断中美 AI 模型性能差距？报告给出的 AI 私人投资规模、生成式 AI 采用率与 AI 事故数量分别是多少？它用什么说法描述 AI 能力发展的不均衡？"
-    notes: "校准要点：投资额原文写作「2,859 亿美元」（带千分位逗号），锚点写 2859 会永远判不中"
+      zh: "斯坦福《2026 年人工智能指数报告》中，2025 年美国人工智能私人投资达到多少亿美元？与中国的投资额相比高出多少倍？"
+      mixed: "2025 年美国 private AI investment 达到多少亿美元？相比中国的 investment 高出多少倍？"
+    notes: >-
+      原文 p11：「美国人工智能私人投资达到 2,859 亿美元，是中国 124 亿美元投资额的 23 倍以上」——
+      投资额带千分位逗号，锚点写 2859 会永远判不中。2026-10-11 从原合题（5 个事实）拆出，只留投资对比。
     facts:
-      - name: 中美模型差距 2.7%
-        patterns: ["2.7%"]
       - name: 美国私人 AI 投资 2,859 亿美元
-        patterns: ["2,859"]
-      - name: 生成式 AI 采用率 88%（组织）
-        patterns: ["88%"]
-      - name: 生成式 AI 采用率 53%（人口）
-        patterns: ["53%"]
-      - name: AI 事故 362 起（2025）
-        patterns: ["362"]
-      - name: AI 事故 233 起（2024）
-        patterns: ["233"]
-      - name: 「锯齿状」智能
-        patterns: ["锯齿"]
+        patterns: ["2,859 亿美元"]
+      - name: 中国 124 亿美元
+        patterns: ["124 亿美元"]
+      - name: 高出 23 倍以上
+        patterns: ["23 倍以上"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p11/body 2e89e3c48d6762f3 ← 美国私人 AI 投资 2,859 亿美元、中国 124 亿美元、高出 23 倍以上
+    gold: [2e89e3c48d6762f3]
 
   - id: kb-08
     kb: 新能源汽车出海
@@ -298,6 +435,10 @@ cases:
         patterns: ["自动驾驶"]
       - name: 四要素：车-路-网-云
         patterns: ["车-路-网-云"]
+    # gold: 最小覆盖集（2 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p3/body 43e354e982dc01bf ← 四要素：车-路-网-云
+    #   p4/body 2382124f2e5a9ce6 ← 场景：智能座舱、场景：组合驾驶辅助、场景：自动驾驶
+    gold: [43e354e982dc01bf, 2382124f2e5a9ce6]
 
   - id: kb-09
     kb: 新能源汽车出海
@@ -312,6 +453,9 @@ cases:
     facts:
       - name: 撰写分工：德勤负责摘要及第一、二、三、五章
         patterns: ["第一、二、三、五"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p2/body 101110252491065c ← 撰写分工：德勤负责摘要及第一、二、三、五章
+    gold: [101110252491065c]
 
   - id: kb-10
     kb: 新能源汽车出海
@@ -339,3 +483,252 @@ cases:
         patterns: ["35% of China"]
       - name: 非欧美市场中国进口车占 55%
         patterns: ["55% of electric car sales"]
+
+  # ===================== 人工智能产业 · 扩充（2026-10-11）=====================
+  # 背景：人工智能产业库 2026-10-11 入库 2 篇（具身智能 152 chunk / 斯坦福 AI 指数 1826 chunk）。
+  # 原 kb-06 / kb-07 各只有 1 题、只有中文查询、没有 gold。本次按 ICCT / 贝莱德的规格补齐，
+  # 并贯彻一条原则：**一题一主题**——Top-5 只有 5 个槽位，一题背 4~5 个事实时后几条必然挤不下
+  # （实测 kb-06 的「移动类/操作类」、kb-07 的「362/233/锯齿」长年召不回，根因就是合题）。
+  # 锚点全部对着 v3 索引原文核过（`python -m app.eval.calibrate_retrieval`），gold 由 build_gold 生成。
+  #
+  # 文档 A：中国信通院-具身智能发展报告（2025年）.pdf —— kb-11 ~ kb-15
+  # 文档 B：斯坦福-2026年人工智能指数报告（官方中文版）.pdf —— kb-16 ~ kb-22
+    # gold: 最小覆盖集（3 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p10/body de963475313fd055 ← 2025 全球销量超 2000 万辆、全球每四辆新车一辆电动（one-quarter）
+    #   p10/body c2b76e38d4a68339 ← 全球每四辆新车一辆电动（one-quarter）、欧洲销量增长超 30%、欧洲占其总销量 28%
+    #   p14/body 51cd1e9dfcf84865 ← 中国汽车出口中电动车超 35%、非欧美市场中国进口车占 55%
+    gold: [de963475313fd055, c2b76e38d4a68339, 51cd1e9dfcf84865]
+
+  - id: kb-11
+    kb: 人工智能产业
+    doc: 中国信通院-具身智能发展报告（2025年）.pdf
+    doc_lang: zh
+    queries:
+      zh: "《具身智能发展报告（2025年）》把具身智能产品按载体分成哪两类？它们各自要解决什么问题？"
+      mixed: "报告把 embodied AI 产品按 carrier 分成哪两类？各自解决「去哪里」和「干什么」？"
+    notes: "原文 p3：「……为代表的移动类产品，解决“去哪里”问题；以……等操作类产品，解决“干什么”问题」。从原 kb-06 拆出。"
+    facts:
+      - name: 移动类产品（去哪里）
+        patterns: ["移动类产品"]
+      - name: 操作类产品（干什么）
+        patterns: ["操作类产品"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p3/body f7eaf3be688ec4ee ← 移动类产品（去哪里）、操作类产品（干什么）
+    gold: [f7eaf3be688ec4ee]
+
+  - id: kb-12
+    kb: 人工智能产业
+    doc: 中国信通院-具身智能发展报告（2025年）.pdf
+    doc_lang: zh
+    queries:
+      zh: "《具身智能发展报告（2025年）》提出具身智能闭环系统由哪三个核心要素构成？其中被称为未来生活“智三样”的是哪三类产品？"
+      mixed: "具身智能 closed-loop system 的三个 core elements 是什么？被称为未来生活「智三样」的是哪三类产品？"
+    notes: "原文 p8：「核心三要素包括：一是具身本体……二是智能内核……三是环境交互」；同页「人形机器人、无人驾驶汽车和无人机又被称为未来生活“智三样”」。"
+    facts:
+      - name: 三要素：具身本体
+        patterns: ["具身本体"]
+      - name: 三要素：智能内核
+        patterns: ["智能内核"]
+      - name: 三要素：环境交互
+        patterns: ["环境交互"]
+      - name: 智三样
+        patterns: ["智三样"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p8/body f7d67d3e8c71702e ← 三要素：具身本体、三要素：智能内核、三要素：环境交互、智三样
+    gold: [f7d67d3e8c71702e]
+
+  - id: kb-13
+    kb: 人工智能产业
+    doc: 中国信通院-具身智能发展报告（2025年）.pdf
+    doc_lang: zh
+    queries:
+      zh: "《具身智能发展报告（2025年）》引用 Grand View Research 预测：到 2030 年人形机器人、自动驾驶汽车（L1-L3）与无人机的市场规模分别是多少？三者累计市场规模将达到多少？"
+      mixed: "报告引用 Grand View Research 预测 2030 年 humanoid robots / autonomous vehicles (L1-L3) / drones 的 market size 各是多少亿美元？累计多少？"
+    notes: "原文 p10：「到2030 年被誉为“智三样”的人形机器人约40.4 亿美元，自动驾驶汽车（L1-L3）约1722 亿美元，以及无人机约1636 亿美元，累计市场规模将达到 3398.4 亿美元」。注意「1636 亿美元」在斯坦福报告 p182 也出现（指私人 AI 投资），故锚点必须带「无人机约」前缀，否则跨文档假阳性。"
+    facts:
+      - name: 人形机器人约 40.4 亿美元
+        patterns: ["40.4 亿美元"]
+      - name: 自动驾驶汽车约 1722 亿美元
+        patterns: ["1722 亿美元"]
+      - name: 无人机约 1636 亿美元
+        patterns: ["无人机约1636 亿美元"]
+      - name: 累计 3398 亿美元
+        patterns: ["3398"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p10/body 0ba2f9b62b8fad5b ← 人形机器人约 40.4 亿美元、自动驾驶汽车约 1722 亿美元、无人机约 1636 亿美元、累计 3398 亿美元
+    gold: [0ba2f9b62b8fad5b]
+
+  - id: kb-14
+    kb: 人工智能产业
+    doc: 中国信通院-具身智能发展报告（2025年）.pdf
+    doc_lang: zh
+    queries:
+      zh: "《具身智能发展报告（2025年）》把具身智能技术路径整体分为哪四条？其中哪一条聚焦机器人运动技能学习，另外三条旨在构建通用大脑？"
+      mixed: "报告把具身智能 technology routes 分为哪四条？哪一条聚焦 motion-skill learning，另三条旨在构建 general brain？"
+    notes: "原文 p19：「具身智能技术路径整体可分为四条，包括模块化分层、分层大模型、端到端大模型和世界模型……模块化分层路线聚焦机器人运动技能学习突破，其他三条路线旨在发展具身基础模型」。"
+    facts:
+      - name: 技术路径整体可分为四条
+        patterns: ["技术路径整体可分为四条"]
+      - name: 模块化分层
+        patterns: ["模块化分层"]
+      - name: 分层大模型
+        patterns: ["分层大模型"]
+      - name: 端到端大模型
+        patterns: ["端到端大模型"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p19/body 8a70d70a66839c02 ← 技术路径整体可分为四条、模块化分层、分层大模型、端到端大模型
+    gold: [8a70d70a66839c02]
+
+  - id: kb-15
+    kb: 人工智能产业
+    doc: 中国信通院-具身智能发展报告（2025年）.pdf
+    doc_lang: zh
+    queries:
+      zh: "《具身智能发展报告（2025年）》显示，我国具身智能企业数量排名前三的省市分别是哪里、各有多少家企业？三地合计占比多少？"
+      mixed: "报告显示我国 embodied AI 企业数量前三的省市是哪里（各多少家）？三地合计占比约多少？"
+    notes: "原文 p53：「北京市（93 家）、广东省（78 家）、上海市（50 家）三地企业数量合计占比近50%」——括号为全角。"
+    facts:
+      - name: 北京 93 家
+        patterns: ["北京市（93 家）"]
+      - name: 广东 78 家
+        patterns: ["广东省（78 家）"]
+      - name: 上海 50 家
+        patterns: ["上海市（50 家）"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p53/body c2657e3b819b2664 ← 北京 93 家、广东 78 家、上海 50 家
+    gold: [c2657e3b819b2664]
+
+  - id: kb-16
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》称，2025 年 2 月哪款模型一度与美国顶级模型持平？截至 2026 年 3 月，中美最优模型的性能差距缩小到多少？"
+      mixed: "2025 年 2 月哪款 model 一度与美国 top models 持平？截至 2026 年 3 月，中美最优 model 的 gap 缩到多少？"
+    notes: "原文 p10：「2025 年 2 月，DeepSeek-R1 一度与美国顶级模型持平；截至 2026 年 3 月，Anthropic 最优模型仅以 2.7% 的差距领先」。锚点取长短语而非裸 2.7%。"
+    facts:
+      - name: DeepSeek-R1 一度持平
+        patterns: ["DeepSeek-R1 一度与美国顶级模型持平"]
+      - name: 差距缩小到 2.7%
+        patterns: ["仅以 2.7% 的差距领先"]
+    # gold: 1 个答案单元（2 块）—— 单元内命中任一即算命中，主键 = content_hash
+    #   [等价组] 以下块互为同一答案的等价出处，命中任一即算该单元命中：
+    #     p10/body 890fdf16a1f2481c ← DeepSeek-R1 一度持平、差距缩小到 2.7%
+    #     p10/body 4ec99419f89b3333 ← DeepSeek-R1 一度持平、差距缩小到 2.7%
+    gold: [[890fdf16a1f2481c, 4ec99419f89b3333]]
+
+  - id: kb-17
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》中，生成式人工智能用多久达到了多高的人口采用率？报告举了哪两个采用率高于预期的国家、数值分别是多少？"
+      mixed: "报告称 generative AI 用多久达到多少的 population adoption rate？举了哪两个 adoption 高于预期的国家（数值）？"
+    notes: "原文 p11：「生成式人工智能在三年内达到 53% 的人口采用率……例如新加坡为 61%，阿拉伯联合酋长国为 64%，而美国以 28.3% 排名第 24 位」。三个锚点都带长短语，避免裸百分比。"
+    facts:
+      - name: 三年内 53% 人口采用率
+        patterns: ["53% 的人口采用率"]
+      - name: 新加坡 61%
+        patterns: ["新加坡为 61%"]
+      - name: 阿联酋 64%
+        patterns: ["阿拉伯联合酋长国为 64%"]
+      - name: 美国 28.3% 排第 24
+        patterns: ["28.3% 排名第 24"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p11/body 34c4621a5fe157c2 ← 三年内 53% 人口采用率、新加坡 61%、阿联酋 64%、美国 28.3% 排第 24
+    gold: [34c4621a5fe157c2]
+
+  - id: kb-18
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》中，记录在案的人工智能事故（事件）数量在 2025 年和 2024 年分别是多少起？"
+      mixed: "报告中 documented AI incidents 2025 年和 2024 年各是多少起？"
+    notes: "原文 p10：「记录在案的人工智能事故数量升至 362 起，高于 2024 年的 233 起」；p128 另有「人工智能事件数据库在 2025 年记录了 362 起事件」。措辞不同，锚点取两处均可命中的长短语。"
+    facts:
+      - name: 2025 年 362 起
+        patterns: ["事故数量升至 362 起", "记录了 362 起事件"]
+      - name: 2024 年 233 起
+        patterns: ["2024 年的 233 起"]
+    # gold: 1 个答案单元（2 块）—— 单元内命中任一即算命中，主键 = content_hash
+    #   [等价组] 以下块互为同一答案的等价出处，命中任一即算该单元命中：
+    #     p10/body c80793d3aa64a73b ← 2025 年 362 起、2024 年 233 起
+    #     p128/body 6bae8c2f7f2ab7d2 ← 2025 年 362 起、2024 年 233 起
+    gold: [[c80793d3aa64a73b, 6bae8c2f7f2ab7d2]]
+
+  - id: kb-19
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》用哪个说法描述「模型能在国际数学奥林匹克竞赛中摘金、却无法可靠读取时间」这类能力不均衡现象？"
+      mixed: "报告中「IMO 摘金却无法可靠读时间」这种能力不均衡，用什么 term 描述？"
+    notes: "原文 p10：「……却仍无法可靠地判断时间——这正是研究人员所说的人工智能“锯齿状前沿（jagged frontier）”」；p72 另一种写法「锯齿状智能」+「无法可靠读取时间」。"
+    facts:
+      - name: 锯齿状前沿（jagged frontier）
+        patterns: ["锯齿状前沿"]
+      - name: IMO 摘金但读不了时间
+        patterns: ["无法可靠地判断时间", "无法可靠读取时间"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p10/body d91ea9d8aa25fa2a ← 锯齿状前沿（jagged frontier）、IMO 摘金但读不了时间
+    gold: [d91ea9d8aa25fa2a]
+
+  - id: kb-20
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》指出，机器人在家务任务中的成功率是多少？在 RLBench 软件仿真操作任务中的成功率又是多少？"
+      mixed: "报告称 robots 在家务任务 household chores 的成功率是多少？RLBench 仿真操作任务的成功率又是多少？"
+    notes: "原文 p10：「机器人在家务任务中的成功率仅为 12%，这凸显出人工智能距离真正掌握物理世界仍有很长距离。在 RLBench 上……成功率已达到 89.4%」。"
+    facts:
+      - name: 家务任务成功率 12%
+        patterns: ["家务任务中的成功率仅为 12%"]
+      - name: RLBench 仿真 89.4%
+        patterns: ["成功率已达到 89.4%"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p10/body c80793d3aa64a73b ← 家务任务成功率 12%、RLBench 仿真 89.4%
+    gold: [c80793d3aa64a73b]
+
+  - id: kb-21
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》中，2025 年拥有数据中心数量最多的国家是哪国、有多少座？紧随其后的德国、英国、中国各有多少座？"
+      mixed: "报告中 2025 年 data centers 数量最多的国家是哪国（多少座）？德国/英国/中国各多少座？"
+    notes: "原文 p33：「2025 年，美国以大幅优势领先，拥有 5,427 座数据中心，超过任何其他国家数量的十倍以上。德国（529 座）、英国（523 座）和中国（449 座）紧随其后」。"
+    facts:
+      - name: 美国 5,427 座
+        patterns: ["5,427 座数据中心"]
+      - name: 德国 529 座
+        patterns: ["德国（529 座）"]
+      - name: 英国 523 座
+        patterns: ["英国（523 座）"]
+      - name: 中国 449 座
+        patterns: ["中国（449 座）"]
+    # gold: 最小覆盖集（1 块）—— 覆盖全部锚点的最少块，主键 = content_hash
+    #   p33/body 4682590a2f7a5ad5 ← 美国 5,427 座、德国 529 座、英国 523 座、中国 449 座
+    gold: [4682590a2f7a5ad5]
+
+  - id: kb-22
+    kb: 人工智能产业
+    doc: 斯坦福-2026年人工智能指数报告（官方中文版）.pdf
+    doc_lang: zh
+    queries:
+      zh: "斯坦福《2026 年人工智能指数报告》给出的 AI 环境代价：Grok 4 训练过程的估算排放量是多少？AI 数据中心的电力容量升至多少、相当于哪个州的峰值用电需求？仅 GPT-4o 推理环节的年度用水量约相当于多少人的饮用水需求？"
+      mixed: "报告给出 Grok 4 training emissions 多少吨 CO₂e？AI data center 电力容量升至多少吉瓦（相当于哪州峰值用电）？GPT-4o 推理年用水量约合多少人饮用水？"
+    notes: "原文 p15：「2025 年，Grok 4 训练过程的估算排放量达到72,816吨二氧化碳当量。AI 数据中心的电力容量升至 29.6 吉瓦，与纽约州峰值用电需求相当；仅 GPT-4o 推理环节的年度用水量，就可能超过 120 万人的饮用水需求」。"
+    facts:
+      - name: Grok 4 排放 72,816 吨
+        patterns: ["72,816吨二氧化碳当量"]
+      - name: 数据中心电力 29.6 吉瓦
+        patterns: ["29.6 吉瓦"]
+      - name: 用水超 120 万人
+        patterns: ["120 万人的饮用水", "120万人的饮用水"]
+    # gold: 1 个答案单元（2 块）—— 单元内命中任一即算命中，主键 = content_hash
+    #   [等价组] 以下块互为同一答案的等价出处，命中任一即算该单元命中：
+    #     p11/body 03ecd077e7ecc9bd ← Grok 4 排放 72,816 吨、数据中心电力 29.6 吉瓦、用水超 120 万人
+    #     p15/body 9c4c5f2f111e9c15 ← Grok 4 排放 72,816 吨、数据中心电力 29.6 吉瓦、用水超 120 万人
+    gold: [[03ecd077e7ecc9bd, 9c4c5f2f111e9c15]]

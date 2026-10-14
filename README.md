@@ -9,7 +9,7 @@ deepsearch-agents 是一个面向复杂研究任务的对话式多智能体系�
 - 多智能体协作：主智能体负责分析、规划、调度和汇总，专业智能体分别处理网络搜索、数据库查询和知识库检索。
 - **反思循环**：每轮执行结束后由独立评估器判断信息是否足以回答原问题，不充分时识别缺口维度并驱动补充检索，最多迭代 3 轮（可通过环境变量调整），直到信息充分、轮数耗尽或 token 预算用尽。
 - 多来源研究：支持结合公开资料、结构化业务数据、私有知识库和本地上传文件完成综合分析。
-- **混合检索知识库**：自建 RAG（结构感知切分 + Qdrant 向量检索 + Elasticsearch 关键词检索），两路结果用 RRF 融合排序，再用 cross-encoder（bge-reranker-v2-m3，进程内 ONNX）精排——候选池召回 91.7% 而 RRF 只排到 59.3%，精排补回 27.7 个百分点至 87.0%；ES 未启动时关键词路自动回退进程内 `rank-bm25`，embedding 或 Qdrant 不可用时向量路缺席，精排不可用时保持 RRF 原序，最差情况仍保有纯关键词检索，知识库能力不中断。
+- **混合检索知识库**：自建 RAG（结构感知切分 + Qdrant 向量检索 + Elasticsearch 关键词检索），两路结果用 RRF 融合排序，再用 cross-encoder（bge-reranker-v2-m3，进程内 ONNX + CUDA，fp16 权重）精排——候选池召回 87.2% 而 RRF 融合只排到 64.0%，精排补回 15.1 个百分点至 **79.1%**（chunk 级 gold Recall@5，33 题 / 46 个答案单元口径），端到端 P50 **439ms**；支持 PDF / Word / Markdown / 纯文本 / PPT / HTML 入库，非 PDF 文档同样产出章节层级与表格结构；ES 未启动时关键词路自动回退进程内 `rank-bm25`，embedding 或 Qdrant 不可用时向量路缺席，精排不可用时保持 RRF 原序，最差情况仍保有纯关键词检索，知识库能力不中断。
 - 实时过程展示：后端通过 WebSocket 推送任务状态、智能体调用、工具调用、反思评估、结果和异常信息。
 - **网络调用容错**：搜索等外部调用带「连接池重试 + 指数退避」，且失败时降级为可读错误交回模型决策（可换词重搜或改用其他信息源），不会因一次网络抖动作废整轮研搜；任务中途异常时保留已产出的部分结果并明确标注不完整。
 - 文件输入与输出：支持读取常见办公文档和文本文件，并生成 Markdown 或 PDF 报告。
@@ -52,7 +52,7 @@ deepsearch-agents/
 │  └─ output/             任务生成的文件
 ├─ docker/
 │  ├─ elasticsearch/      自建 ES 镜像（Dockerfile + IK 中文分词插件包）
-│  ├─ embedding/          本地 embedding 模型目录（bge-large-zh-v1.5，不入 git）
+│  ├─ embedding/          本地 embedding 模型辅助目录（bge-m3 权重放 .workbuddy/models/，不入 git）
 │  ├─ reranker/           精排模型目录（bge-reranker-v2-m3 + 导出的 ONNX，不入 git）
 │  ├─ mysql/mysql.sql     MySQL 初始化数据
 │  └─ docker-compose.yaml MySQL / embedding / Qdrant / Elasticsearch 的编排（Kibana、reranker 可选）
@@ -146,10 +146,10 @@ TAVILY_BACKOFF_BASE=0.8
 # TAVILY_HTTPS_PROXY=http://127.0.0.1:7890
 
 # 自建 RAG embedding（可选，留空时检索自动降级为纯 BM25，知识库能力仍可用）
-# 推荐用本地 TEI 服务加载 bge-large-zh-v1.5（1024 维，离线、无 key）
+# 推荐用本地 TEI 服务加载 bge-m3（1024 维，中英跨语言，离线、无 key）
 EMBEDDING_BASE_URL=http://localhost:8081/v1
 EMBEDDING_API_KEY=local-tei
-EMBEDDING_MODEL=bge-large-zh-v1.5
+EMBEDDING_MODEL=bge-m3
 EMBEDDING_PORT=8081
 # 也可换成任意 OpenAI 兼容 /embeddings 端点（硅基流动、DashScope 等）
 
@@ -187,6 +187,8 @@ REFLECTION_TOKEN_BUDGET=150000
 
 首次使用知识库前，需要摄入本地文档生成索引（docs/knowledge_base 下每个子目录是一个知识库）：原文写入 `app/rag/indexes/<知识库>/chunks.jsonl`，向量写入 Qdrant，关键词索引写入 Elasticsearch。
 
+支持的文档格式：`.pdf` / `.docx` / `.md` / `.markdown` / `.txt` / `.pptx` / `.html` / `.htm`。PDF 走自研版面解析（分栏还原、页眉页脚剔除、标题多信号、表格独立成块、扫描页 OCR）；其余格式走统一结构化解析——先把各格式转成统一的中间表示（标题 / 正文 / 表格），再按**与 PDF 相同的字段契约**产出 chunk。因此非 PDF 文档的章节路径（`section_path`）、表格（`chunk_type=table` + 行列元数据）都是真值，不会因为格式不同而退化成纯文本（见 `docs/design.md` ADR-017）。
+
 ```bash
 python -m app.rag.ingest          # 增量摄入
 python -m app.rag.ingest --force  # 全量重建（同时清理并重写 Qdrant / ES 中该知识库的数据）
@@ -207,7 +209,7 @@ docker compose --env-file .env -f docker/docker-compose.yaml up -d
 | 服务 | 作用 | 缺失时的表现 |
 |------|------|--------------|
 | `mysql` | 业务数据信源 | 数据库查询助手不可用 |
-| `embedding` | 本地 TEI + bge-large-zh-v1.5，提供 1024 维向量 | 向量路缺席，仅关键词路 |
+| `embedding` | 本地 TEI（GPU 版）+ bge-m3，提供 1024 维向量 | 向量路缺席，仅关键词路 |
 | `qdrant` | 向量库，存放 chunk 向量 | 向量路缺席，仅关键词路 |
 | `elasticsearch` | 关键词索引（IK 中文分词，自建镜像） | 关键词路回退进程内 `rank-bm25` |
 
@@ -225,8 +227,8 @@ docker compose --env-file .env -f docker/docker-compose.yaml up -d --build elast
 docker compose --env-file .env -f docker/docker-compose.yaml ps
 ```
 
-`embedding` 服务需要模型文件位于 `docker/embedding/bge-large-zh-v1.5/`（约 1.3GB，不入 git）。
-1.3GB 模型在 CPU 上冷启动需要几分钟，`/health` 返回 200 后才可用——期间向量路缺席，检索回退关键词路。
+`embedding` 服务需要模型文件位于 `.workbuddy/models/bge-m3/`（约 2.2GB，不入 git），并使用 **GPU 版镜像**（需 Docker 已启用 nvidia runtime）。
+2.2GB 模型冷启动约 1 分钟，`/health` 返回 200 后才可用——期间向量路缺席，检索回退关键词路。
 
 也可以只启动其中某个服务，例如只需要关键词 + 向量双路检索：
 
@@ -245,8 +247,25 @@ NDCG@5 与查询延迟 P50、P95）：
 ```bash
 python -m app.eval.eval_retrieval            # 全部题库 × 五种模式
 python -m app.eval.eval_retrieval --diag     # 附带 Recall@20 诊断列
-python -m app.eval.eval_retrieval --mode hybrid_rerank   # 只跑精排
+python -m app.eval.eval_retrieval --timing   # 附带「①召回+RRF / ②精排 / ③检索层 / ④端到端」三段耗时拆解
+python -m app.eval.eval_retrieval --diag-table  # 逐 gold 块的四阶段排名 + miss 归因（A召回/B融合/C精排）
+python -m app.eval.eval_retrieval --mode hybrid_rerank --rerank-k 15   # 换候选深度重跑
 python -m app.eval.eval_retrieval --list     # 只看题库与各知识库入库状态
+```
+
+精排是端到端延迟的大头，因此另备两个**只读**基准脚本：
+
+```bash
+python -m app.eval.bench_rerank --ks 25 --batches 4,8,16,25 --reps 20   # 批大小 × 候选数 的耗时矩阵
+python -m app.eval.bench_concurrency --mode hybrid_rerank --concurrency 1,2,4,8   # 并发吞吐与延迟分布
+```
+
+精排默认走 fp16 权重（体积减半、延迟约再降一半，实测指标逐条 0/60 变化）。换机器时若想启用，
+先跑一次转换（不跑也能正常工作，auto 会静默回落到 fp32，只是慢一倍）：
+
+```bash
+python docker/reranker/export_onnx_fp16.py            # 从 onnx/ 生成 onnx_fp16/（约 1.06 GiB）
+python docker/reranker/export_onnx_fp16.py --check    # 只做 fp32/fp16 数值对比，不落盘
 ```
 
 ### 6. 启动后端
