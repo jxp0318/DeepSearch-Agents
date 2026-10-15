@@ -1,8 +1,43 @@
-# deepsearch-agents 评测集 v0（27 条，待首跑校准）
-# 依据 app/eval/eval.md 第 5 节校准流程：DB 类 gold_facts 基于表结构推断，
-# 首跑时必须对照库内真实数据修正；KB 类对照 PDF 原文核对；web 类核对事实锚点当前可搜。
+# =============================================================================
+# deepsearch-agents 生成层评测集 v1（30 条）
+#
+# 口径（2026-10-15 定稿，与 app/eval/eval.md 第 10 节配套）：
+#   · **单臂**：只评测「最新版」配置（反思 3 轮 + 引用规范 + 检索 hybrid_rerank）。
+#     暂不设「原始版」对照臂，因此本表产出的是**绝对值**，不含「提升了多少」。
+#   · 每条任务跑 3 次（LLM 非确定性），3 次中 ≥2 次 pass 记为该任务 pass。
+#   · 7 个指标：任务成功率 / 答案正确率 / Faithfulness / 引用准确率 /
+#     平均工具调用次数 / P50-P95 延迟 / 单任务 API 成本。
+#
+# 字段说明（新增字段是为了让 7 个指标可判，均为可选但强烈建议填全）：
+#   gold_facts            答案正确率：报告必须覆盖的关键事实（judge 逐条语义核对）
+#   gold_answer           答案正确率：可程序化精确校验的答案（仅 DB 数值类；已按库内
+#                         真实数据实测回填，2026-10-15）
+#   faithfulness_anchors  语料存在性补充清单（2026-10-15 起**不再参与判分**，判分改用
+#                         claim 级 anchors）；可回原文逐字比对的最小事实单元
+#                         （只收数字 / 专名 / 术语；描述型判断不进）
+#   required_citations    引用准确率：哪些结论必须带引用
+#                         cite_kind: chunk      → 须标【引用BN-I】
+#                           anchor_match: true → 参与 Faithfulness，并须配 `anchors`：
+#                             该 claim 专属的锚点（数字/专名），判据 = judge 抄回的
+#                             「这句话挂的编号」所指向的 chunk 含任一锚点
+#                             跑 `--check-anchors` 确认锚点能逐字命中
+#                           综合/对比类 claim 不配 anchor_match（证据不是一句可比对的话，
+#                             硬配只会送分），交给 judge 单判
+#                         cite_kind: query_cond → DB 类，判据 = 写明表名与筛选条件
+#                         cite_kind: url        → 网络类，判据 = 给出来源链接
+#   require_file          是否必须产出 md / pdf
+#   expected_rounds       期望迭代轮数（用于「反思是否真的在起作用」）
+#   max_tool_calls        工具调用上限，超出记为跑偏（跑偏不直接判 fail，但会在报告里标出）
+#
+# ⚠️ 时间敏感题（跑批前必读）：
+#   db-04 的答案依赖运行日期（批次 MY-250101-A 于 2027-01-01 到期），2027-01-01 之后
+#   本题会「无数据可答」，届时须换成新的时间窗口，不要保留一个恒空的 gold。
+#   web-* 五题答案随时间漂移，judge 只核「论断与来源是否自洽」，不核具体数值。
+# =============================================================================
 
-# ========== 数据库类（5 条，信源：deepsearch_db 制药业务库）==========
+# ============================== 数据库类（5 条，信源：deepsearch_db 制药业务库）==========
+# 数据规模（2026-10-15 实测）：drugs 50 行 / inventory 150 行 / sales_records 100 行
+# / 8 个区域 / 24 个治疗领域。全部 gold_answer 已用 SQL 实测回填。
 
 - id: db-01
   category: database
@@ -11,9 +46,21 @@
   expected_sources: [mysql]
   must_reflect: false
   gold_facts:
-    - "商品名（brand_name 字段值）"
-    - "规格（specifications 字段值，如 0.3g*24粒/盒 形态）"
-  gold_answer: null  # 校准时从 drugs 表实测回填
+    - "商品名是「芬必得」"
+    - "规格是 0.3g*20粒"
+  gold_answer:
+    brand_name: "芬必得"
+    specifications: "0.3g*20粒"
+  faithfulness_anchors:
+    - { text: "芬必得", kind: entity }
+    - { text: "0.3g*20粒", kind: number }
+  required_citations:
+    - claim: "布洛芬缓释胶囊的商品名与规格"
+      must_cite: true
+      cite_kind: query_cond
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 8
 
 - id: db-02
   category: database
@@ -22,8 +69,27 @@
   expected_sources: [mysql]
   must_reflect: false
   gold_facts:
-    - "心血管领域药品清单（治疗领域字段匹配）"
+    - "心血管领域药品清单（6 个品种）"
     - "每个药品的库存总量（inventory.quantity_on_hand 按 drug_id 聚合）"
+  gold_answer:
+    # 2026-10-15 实测，容差 ±1%
+    total_stock:
+      - { drug: "琥珀酸美托洛尔缓释片", quantity: 21700 }
+      - { drug: "阿司匹林肠溶片",       quantity: 13500 }
+      - { drug: "瑞舒伐他汀钙片",       quantity: 12400 }
+      - { drug: "硫酸氢氯吡格雷片",     quantity: 10900 }
+      - { drug: "阿托伐他汀钙片",       quantity: 7500 }
+      - { drug: "依折麦布片",           quantity: 7200 }
+  faithfulness_anchors:
+    - { text: "琥珀酸美托洛尔缓释片", kind: entity }
+    - { text: "21700", kind: number }
+  required_citations:
+    - claim: "心血管领域各药品库存总量"
+      must_cite: true
+      cite_kind: query_cond
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 12
 
 - id: db-03
   category: database
@@ -34,7 +100,22 @@
   gold_facts:
     - "销售额 TOP3 药品名称"
     - "对应 total_amount 与 quantity_sold 数值"
-  gold_answer: null  # 校准时以 SUM/ORDER BY 实测回填
+  gold_answer:
+    # 2026-10-15 实测：SUM(total_amount) / SUM(quantity_sold) 按药品聚合
+    top3:
+      - { drug: "连花清瘟胶囊",           total_amount: 1200000.00, quantity_sold: 60000 }
+      - { drug: "磷酸奥司他韦胶囊",       total_amount: 700000.00,  quantity_sold: 7000 }
+      - { drug: "富马酸替诺福韦二吡呋酯片", total_amount: 186000.00, quantity_sold: 360 }
+  faithfulness_anchors:
+    - { text: "连花清瘟胶囊", kind: entity }
+    - { text: "1200000", kind: number }
+  required_citations:
+    - claim: "销售额 TOP3 药品及其销售额与销量"
+      must_cite: true
+      cite_kind: query_cond
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 12
 
 - id: db-04
   category: database
@@ -43,10 +124,34 @@
   expected_sources: [mysql]
   must_reflect: false
   gold_facts:
-    - "过期批次药品清单（expiry_date 日期条件过滤）"
+    - "未来 6 个月内到期的批次清单（2026-10-15 实测共 50 条批次记录）"
     - "仓库位置（warehouse_location）"
     - "治疗领域（关联 drugs 表）"
-  note: 考察多表 join + 日期计算；若库内无 6 个月内到期批次，校准时放宽窗口
+  gold_answer:
+    # 2026-10-15 实测：全部为批次 MY-250101-A，到期日 2027-01-01
+    total_rows: 50
+    batch_number: "MY-250101-A"
+    expiry_date: "2027-01-01"
+    samples:
+      - { drug: "阿莫西林胶囊",     warehouse: "北京一号库-A区",     area: "抗生素" }
+      - { drug: "布洛芬缓释胶囊",   warehouse: "天津二号库-冷藏区",   area: "解热镇痛" }
+      - { drug: "盐酸二甲双胍片",   warehouse: "北京二号库-B区",     area: "糖尿病" }
+      - { drug: "阿托伐他汀钙片",   warehouse: "天津一号库-贵重药区", area: "心血管" }
+      - { drug: "磷酸奥司他韦胶囊", warehouse: "北京一号库-急救药区", area: "抗病毒" }
+      - { drug: "注射用头孢曲松钠", warehouse: "天津二号库-阴凉库",   area: "抗生素" }
+  faithfulness_anchors:
+    - { text: "MY-250101-A", kind: code }
+    - { text: "2027-01-01", kind: date }
+  required_citations:
+    - claim: "未来 6 个月内过期的批次清单"
+      must_cite: true
+      cite_kind: query_cond
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 12
+  note: >
+    ⚠️ 时间敏感：本题 gold 依赖运行日期。批次 MY-250101-A 于 2027-01-01 到期，
+    届时本题会「无数据可答」——换新的时间窗口重测，不要保留恒空的 gold。
 
 - id: db-05
   category: database
@@ -58,8 +163,35 @@
     - "区域 × 治疗领域聚合结果"
     - "最优组合的具体区域与领域名"
     - "该区域主要客户（customer_name）"
+  gold_answer:
+    # 2026-10-15 实测
+    best_combo: { region: "全国", therapeutic_area: "中成药/感冒", amount: 1000000.00 }
+    top_customer: { name: "全国连锁大药房总仓", amount: 1000000.00 }
+    runner_ups:
+      - { region: "东北区", therapeutic_area: "抗病毒", amount: 500000.00 }
+      - { region: "华南区", therapeutic_area: "糖尿病", amount: 240240.00 }
+  faithfulness_anchors:
+    - { text: "全国连锁大药房总仓", kind: entity }
+    - { text: "中成药/感冒", kind: term }
+  required_citations:
+    - claim: "销售额最高的区域-治疗领域组合"
+      must_cite: true
+      cite_kind: query_cond
+    - claim: "该区域主要客户"
+      must_cite: true
+      cite_kind: query_cond
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 14
 
-# ========== 知识库类（10 条，信源：自建 RAG 知识库，4 库共 11 份 PDF）==========
+# ============================== 知识库类（13 条，信源：自建 RAG，4 库 12 份 PDF）==========
+# 文档覆盖对照（2026-10-15）：
+#   人工智能产业：中国信通院-AI产业发展研究报告 / 具身智能发展报告 / 斯坦福AI指数
+#   新能源汽车出海：ICCT-Global-EV-Monitor(英文) / IEA-Global EV Outlook 2026(英文)
+#                    / 信通院-车联网蓝皮书 / 德勤-AI驱动汽车产业价值重构
+#   电商行业：2026数字人电商直播白皮书 / 全球电商行业AI应用研究报告2025
+#   金融行业：央行2025Q4货币政策执行报告 / 贝莱德2026全球投资展望 / 长江商学院投资者情绪调查
+#   → 12 份文档**全部有题覆盖**，其中英文文档 2 份（IEA / ICCT）单独设题并设跨文档对比题。
 
 - id: kb-01
   category: knowledge_base
@@ -68,7 +200,20 @@
   expected_sources: [knowledge_base]
   must_reflect: false
   gold_facts:
-    - "白皮书列出的主要应用场景清单（校准时对照原文）"
+    - "白皮书列出的主要应用场景清单"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "数字人", kind: term }
+    - { text: "白皮书", kind: term }
+  required_citations:
+    - claim: "数字人直播的主要应用场景"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["应用场景", "真人主播数字分身", "AI总裁背书"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 10
 
 - id: kb-02
   category: knowledge_base
@@ -79,6 +224,19 @@
   gold_facts:
     - "对股票市场的核心判断"
     - "具体配置建议（增持/减持方向）"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "贝莱德", kind: entity }
+    - { text: "BlackRock", kind: entity }
+  required_citations:
+    - claim: "对股票市场的核心判断"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["风险偏好", "分散投资的幻象", "共同驱动因素"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 12
 
 - id: kb-03
   category: knowledge_base
@@ -89,6 +247,19 @@
   gold_facts:
     - "对 A 股预期的关键调查结论"
     - "与其他资产预期的对比"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "长江商学院", kind: entity }
+    - { text: "投资者情绪", kind: term }
+  required_citations:
+    - claim: "对 A 股预期的关键调查结论"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["A 股和港股", "涨幅主要集中于", "上证综指"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 12
 
 - id: kb-04
   category: knowledge_base
@@ -99,6 +270,19 @@
   gold_facts:
     - "货币政策基调表述"
     - "报告指出的主要经济问题清单"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "中国人民银行", kind: entity }
+    - { text: "货币政策", kind: term }
+  required_citations:
+    - claim: "下一阶段货币政策基调"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["适度宽松", "稳健的货币政策"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 14
   note: 63 页长文档，考察检索命中与长上下文综合
 
 - id: kb-05
@@ -110,6 +294,20 @@
   gold_facts:
     - "两份报告的共同判断（至少 2 条）"
     - "各自独有观点（至少各 1 条）"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "电商", kind: term }
+  required_citations:
+    - claim: "两份报告的共同判断"
+      must_cite: true
+      cite_kind: chunk
+    - claim: "各自独有的观点"
+      must_cite: true
+      cite_kind: chunk
+  require_file: true
+  # 两份报告的对比结论适合以报告形式交付
+  expected_rounds: 2
+  max_tool_calls: 20
 
 - id: kb-06
   category: knowledge_base
@@ -121,7 +319,23 @@
     - "投资事件数与融资总额（744 起 / 735.43 亿元）"
     - "移动类载体及对应问题（去哪里）"
     - "操作类载体及对应问题（干什么）"
-  note: 数值型 gold_fact，首跑时对照 PDF 原文核对；该报告由信通院与清华大学电子工程系联合编制
+  gold_answer:
+    # 数值型 gold_fact，首跑时须对照 PDF 原文核对
+    investment_events: 744
+    total_funding: "735.43 亿元"
+  faithfulness_anchors:
+    - { text: "744", kind: number }
+    - { text: "735.43", kind: number }
+    - { text: "具身智能", kind: term }
+  required_citations:
+    - claim: "投资事件数与融资总额"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["744", "735.43"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 12
 
 - id: kb-07
   category: knowledge_base
@@ -135,6 +349,30 @@
     - "生成式 AI 采用率（组织 88% / 人口 53%）"
     - "有记录的 AI 事故数量（2025 年 362 起，2024 年 233 起）"
     - "描述能力分布不均衡的提法（「锯齿状」智能）"
+  gold_answer:
+    # 以下数值取自既有题库 gold_facts，首跑须逐条对照 PDF 原文核对
+    us_china_gap: "约 2.7%"
+    us_private_investment: "约 2859 亿美元"
+    genai_adoption: { organizations: "88%", population: "53%" }
+    ai_incidents: { "2025": 362, "2024": 233 }
+  faithfulness_anchors:
+    - { text: "2.7%", kind: number }
+    - { text: "2859", kind: number }
+    - { text: "斯坦福", kind: entity }
+  required_citations:
+    - claim: "中美模型性能差距的判断"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["2.7%", "中美"]
+    - claim: "AI 私人投资规模与采用率、事故数量"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["2,859", "362", "88%"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 16
   note: 425 页长文档（官方中文版），考察长上下文综合与数字命中
 
 - id: kb-08
@@ -146,6 +384,19 @@
   gold_facts:
     - "核心场景清单（智能座舱 / 信息提醒服务 / 组合驾驶辅助 / 自动驾驶 / 交通管理）"
     - "「车-路-网-云」四要素对应的技术趋势"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "智能网联汽车", kind: term }
+    - { text: "车-路-网-云", kind: term }
+  required_citations:
+    - claim: "核心应用场景清单"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["智能座舱", "组合驾驶辅助", "车-路-网-云"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 14
 
 - id: kb-09
   category: knowledge_base
@@ -156,6 +407,22 @@
   gold_facts:
     - "生成式 AI 在汽车产业的价值重构环节"
     - "撰写分工（德勤负责摘要及第一、二、三、五章；亚马逊云科技负责第四章）"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "德勤", kind: entity }
+    - { text: "亚马逊云科技", kind: entity }
+  required_citations:
+    - claim: "生成式 AI 推动价值重构的环节"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["研、产、供、销、服", "价值重构"]
+    - claim: "白皮书撰写分工"
+      must_cite: true
+      cite_kind: chunk
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 12
   note: 报告全称为《智驭变革：生成式AI驱动汽车产业价值重构》
 
 - id: kb-10
@@ -169,12 +436,121 @@
     - "欧洲电气化乘用车销量增长超 30%，占其总销量 28%"
     - "2025 年中国汽车出口中电动车占比超 35%（2024 年为 20%）"
     - "欧洲与美国以外的市场，中国进口电动车占当地电动车销量的 55%（五年前不足 5%）"
-  note: >-
-    全文为英文（295 页，CC BY 4.0）。这是评测集里唯一一份纯英文文档，而检索侧的
-    embedding 模型是 bge-large-zh-v1.5（中文优化），构成一个天然的跨语言检索样本——
-    首跑时重点观察该题召回质量，可作为「中文查询 / 英文语料」边界的实测证据。
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "IEA", kind: entity }
+    - { text: "Global EV Outlook", kind: term }
+    - { text: "2000", kind: number }
+  required_citations:
+    - claim: "2025 年全球电动汽车销量与市场份额"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["20 million", "one in four"]
+    - claim: "中国在电动汽车出口中的角色"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["Chinese electric car exports", "exports"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 16
+  note: >
+    全文为英文（295 页，CC BY 4.0）。**中文 query × 英文语料**的跨语言检索样本
+    （ADR-010 字段级语言路由：中文 query 只打 zh_text，英文文档 zh_text 为空 ⇒
+    关键词路整体退出，召回主力是向量路 bge-m3）。
 
-# ========== 网络类（5 条，信源：Tavily；答案可能漂移，判分看来源支撑）==========
+- id: kb-11
+  category: knowledge_base
+  difficulty: medium
+  query: 中国信通院《人工智能产业发展研究报告（2025年）》从哪些维度刻画了人工智能产业的发展？报告对大模型、算力基础设施和产业生态分别给出了什么判断？
+  expected_sources: [knowledge_base]
+  must_reflect: false
+  gold_facts:
+    - "报告刻画产业发展所用的维度框架（首跑校准）"
+    - "对大模型发展的判断"
+    - "对算力基础设施的判断"
+    - "对产业生态的判断"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "中国信通院", kind: entity }
+    - { text: "人工智能产业发展研究报告", kind: term }
+    - { text: "算力", kind: term }
+  required_citations:
+    - claim: "对大模型发展的判断"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["多模态", "智能体"]
+    - claim: "对算力基础设施的判断"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["万卡", "算力"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 14
+  note: >
+    新增题（v1）。该文档此前只在 mix-06 里作为「对比对象」出现，没有独立题。
+    本题只锚定 term / entity 级事实，**数值锚点待首跑校准后补**（不要凭空写数字）。
+
+- id: kb-12
+  category: knowledge_base
+  difficulty: medium
+  query: ICCT《Global EV Market Monitor 2025》报告了哪些主要市场的电动车销量与市场份额？有哪些关键结论？
+  expected_sources: [knowledge_base]
+  must_reflect: false
+  gold_facts:
+    - "报告覆盖的主要市场清单"
+    - "各市场销量 / 份额的关键结论（首跑校准数值）"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "ICCT", kind: entity }
+    - { text: "Global EV Market Monitor", kind: term }
+  required_citations:
+    - claim: "各主要市场电动车销量与份额的关键结论"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["light-duty EVs", "market share"]
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 14
+  note: >
+    新增题（v1）。**这是 12 份文档里此前唯一完全没被任何题覆盖的一份**
+    （英文，与 IEA 同库）。与 kb-10（IEA）构成英文文档对照组。
+
+- id: kb-13
+  category: knowledge_base
+  difficulty: hard
+  query: 对比 IEA《Global EV Outlook 2026》与 ICCT《Global EV Market Monitor 2025》两份报告，它们对全球电动车市场规模的判断、对中国电动车角色的描述有哪些一致与分歧？
+  expected_sources: [knowledge_base]
+  must_reflect: true   # 需分别命中两份英文报告，单轮检索难同时命中
+  gold_facts:
+    - "两份报告对全球市场规模判断的一致点与分歧点"
+    - "两份报告对中国电动车角色描述的一致与差异"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "IEA", kind: entity }
+    - { text: "ICCT", kind: entity }
+  required_citations:
+    - claim: "两份报告对全球市场规模判断的对比"
+      must_cite: true
+      cite_kind: chunk
+    - claim: "两份报告对中国角色描述的对比"
+      must_cite: true
+      cite_kind: chunk
+  require_file: true
+  # 两份英文报告的横向对比适合以报告形式交付
+  expected_rounds: 2
+  max_tool_calls: 20
+  note: >
+    新增题（v1）。**两份英文报告的横向对比**——检索侧最难的一档：
+    同一知识库内两篇英文长文档，需要多次不同措辞的检索才能各自命中。
+
+# ============================== 网络类（5 条，信源：Tavily）==========
+# ⚠️ 这五题答案随时间漂移。judge 只核「论断是否有来源支撑 + 与来源是否自洽」，
+#    不核具体数值。expected_sources 记为 tavily（工具名沿用现有命名）。
 
 - id: web-01
   category: web
@@ -185,7 +561,16 @@
   gold_facts:
     - "得主姓名"
     - "获奖成果描述"
-  note: 10 月初刚公布，搜索时效性好；若已过时效（答案广为人知），校准时换题
+  gold_answer: null
+  faithfulness_anchors: []
+  required_citations:
+    - claim: "得主姓名与获奖原因"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 8
+  note: 若答案已广为人知（时效性耗尽），校准时换题
 
 - id: web-02
   category: web
@@ -196,6 +581,15 @@
   gold_facts:
     - "版本号（锚定 GitHub releases）"
     - "主要特性描述"
+  gold_answer: null
+  faithfulness_anchors: []
+  required_citations:
+    - claim: "最新稳定版本号"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 10
   note: 版本随时间漂移，judge 只核报告论断与引用来源一致
 
 - id: web-03
@@ -207,6 +601,15 @@
   gold_facts:
     - "主要功能清单"
     - "定价/额度的大致量级"
+  gold_answer: null
+  faithfulness_anchors: []
+  required_citations:
+    - claim: "定价与免费额度"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 1
+  max_tool_calls: 10
   note: 项目自身依赖的服务，评测时需说明其可用性与前置条件
 
 - id: web-04
@@ -218,6 +621,15 @@
   gold_facts:
     - "至少 3 个项目名称"
     - "架构层面的差异点（编排方式/反思机制/信源）"
+  gold_answer: null
+  faithfulness_anchors: []
+  required_citations:
+    - claim: "开源 Deep Research 项目清单"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 2
+  max_tool_calls: 18
   note: 与本项目直接相关的领域情报，答案本身对后续迭代有用
 
 - id: web-05
@@ -230,8 +642,19 @@
     - "销量数据（量级与同比）"
     - "头部厂商格局描述"
     - "趋势判断有数据来源支撑"
+  gold_answer: null
+  faithfulness_anchors: []
+  required_citations:
+    - claim: "销量数据"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 2
+  max_tool_calls: 16
 
-# ========== 混合类（7 条，多信源综合，反思循环的主战场）==========
+# ============================== 混合类（7 条，多信源综合，反思循环的主战场）==========
+# mixed 类引用判据：KB 来源的 claim 用 cite_kind: chunk（anchor_match），
+# 网络来源的 claim 用 cite_kind: url，DB 来源的用 cite_kind: query_cond。
 
 - id: mix-01
   category: mixed
@@ -243,6 +666,20 @@
     - "解热镇痛类药品库存数据（来自 DB）"
     - "市场层面的判断（来自网络且有来源）"
     - "明确的补货建议及依据"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "解热镇痛", kind: term }
+    - { text: "布洛芬缓释胶囊", kind: entity }
+  required_citations:
+    - claim: "解热镇痛类药品库存数据"
+      must_cite: true
+      cite_kind: query_cond
+    - claim: "市场层面的判断"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 2
+  max_tool_calls: 20
 
 - id: mix-02
   category: mixed
@@ -254,6 +691,22 @@
     - "贝莱德的核心建议"
     - "情绪调查反映的散户行为"
     - "至少 2 条具体的背离点"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "贝莱德", kind: entity }
+    - { text: "长江商学院", kind: entity }
+  required_citations:
+    - claim: "贝莱德的核心建议"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["风险偏好", "共同驱动因素", "黄金"]
+    - claim: "散户行为与机构建议的背离点"
+      must_cite: true
+      cite_kind: chunk
+  require_file: false
+  expected_rounds: 2
+  max_tool_calls: 20
 
 - id: mix-03
   category: mixed
@@ -264,6 +717,21 @@
   gold_facts:
     - "报告中的趋势清单（KB）"
     - "至少 2 个验证案例（网络且有来源）"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "电商", kind: term }
+  required_citations:
+    - claim: "报告中的趋势清单"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["电商技术应用趋势", "区块链技术"]
+    - claim: "行业验证案例"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 2
+  max_tool_calls: 22
 
 - id: mix-04
   category: mixed
@@ -275,6 +743,19 @@
     - "糖尿病领域药品销售数据（来自 DB）"
     - "行业动态（网络且有来源）"
     - "市场机会分析建立在以上数据之上"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "糖尿病", kind: term }
+  required_citations:
+    - claim: "糖尿病领域药品销售数据"
+      must_cite: true
+      cite_kind: query_cond
+    - claim: "行业动态"
+      must_cite: true
+      cite_kind: url
+  require_file: false
+  expected_rounds: 2
+  max_tool_calls: 20
 
 - id: mix-05
   category: mixed
@@ -286,6 +767,23 @@
     - "货币政策基调（KB）"
     - "最新宏观数据（网络且有来源）"
     - "对医药融资形势的推断有依据链"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "中国人民银行", kind: entity }
+    - { text: "货币政策", kind: term }
+  required_citations:
+    - claim: "货币政策基调"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["适度宽松", "稳健的货币政策"]
+    - claim: "最新宏观数据"
+      must_cite: true
+      cite_kind: url
+  require_file: true
+  # 最接近真实 deep research 的一题，必须产出可交付文档
+  expected_rounds: 2
+  max_tool_calls: 22
   note: KB(金融) + web + 行业推断，考察跨域综合，是最接近真实 deep research 的一题
 
 - id: mix-06
@@ -298,6 +796,21 @@
     - "斯坦福报告对中美优势的归结（美国：顶尖模型数量、高影响力专利、私人投资；中国：论文量、引用量、专利总量、工业机器人装机量）"
     - "信通院报告的生态与治理视角（开源生态、智算基础设施、标准竞争、安全治理）"
     - "至少 1 条共同判断 + 至少 1 条视角差异或互补"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "斯坦福", kind: entity }
+    - { text: "中国信通院", kind: entity }
+  required_citations:
+    - claim: "两份报告的共同判断"
+      must_cite: true
+      cite_kind: chunk
+    - claim: "各自独有的视角"
+      must_cite: true
+      cite_kind: chunk
+  require_file: true
+  # 两份长报告的对比结论适合以报告形式交付
+  expected_rounds: 2
+  max_tool_calls: 24
 
 - id: mix-07
   category: mixed
@@ -309,4 +822,22 @@
     - "德勤关于生成式 AI 重构汽车产业价值的判断"
     - "信通院蓝皮书关于 AI 大模型驱动驾驶自动化的判断"
     - "至少 2 条相互印证或互补的结论"
+  gold_answer: null
+  faithfulness_anchors:
+    - { text: "德勤", kind: entity }
+    - { text: "智能网联汽车", kind: term }
+  required_citations:
+    - claim: "德勤对产业价值重构的判断"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["研、产、供、销、服", "智驭变革"]
+    - claim: "信通院对驾驶自动化革新的判断"
+      must_cite: true
+      cite_kind: chunk
+      anchor_match: true
+      anchors: ["驾驶自动化", "路侧感知"]
+  require_file: false
+  expected_rounds: 2
+  max_tool_calls: 24
   note: 同一库内跨文档综合，与 kb-05（跨文档对比）形成同类型不同库的对照

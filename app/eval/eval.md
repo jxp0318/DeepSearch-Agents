@@ -171,3 +171,101 @@ gold 口径以「标准答案的出处」为分母，语义稳定得多，且经
 |------|------|------|------|------|------|------|------|
 | | A | | | | | | |
 | | B | | | | | | |
+
+---
+
+## 10. 生成层评测（2026-10-15 落地，runner = `eval_agent.py`）
+
+第 3~7 节是**检索层**协议与历史结论。本节是**生成层**：完整跑一次 agent 任务才拿得到的 7 个指标。
+
+### 10.1 为什么单臂（2026-10-15 用户拍板）
+
+暂不设「原始版」对照臂，只评测**最新版**配置（反思 3 轮 + 引用规范 + 检索 `hybrid_rerank`）。因此产出的是**绝对值**，不含「提升了多少」。代价要如实说：拿不到 A→B 的提升幅度；收益是省掉一半跑批成本，且不必维护一个「关掉各种优化」的对照配置。
+
+每题跑 **3 次**（LLM 非确定性，单次不可信），3 次中 ≥2 次 `pass` 记该题 pass。
+
+### 10.2 七个指标的口径
+
+| 指标 | 口径 | 判分层 | 备注 |
+|------|------|--------|------|
+| **任务成功率** | `verdict=pass` 的题数比例（judge，3 次多数投票） | LLM judge | 未开 judge 时退化为「三次都正常产出结果」 |
+| **答案正确率** | DB 类：`gold_answer` 数值是否出现在报告（±1% 容差，规则层）；其余：`gold_facts` 覆盖率（judge） | 规则 + judge | 规则层优先，有 `gold_answer` 就不看 judge |
+| **Faithfulness（规则层）**<br>claim 级锚点核验 | 分母 = `required_citations` 里 `anchor_match: true` 的**关键 claim 数**；分子 = 该 claim **自己标注的那些编号**里，存在「编号在本次采集映射中真实存在、且其 chunk 原文含该 claim 的 `anchors` 任一项」的 claim 数 | 规则层（编号配对由 judge 提供） | 2026-10-15 改口径：上一版拿报告里**全部**编号做存在性匹配（实测 157 个编号 vs 5 条 claim），任何一条含锚点即放行，等于测「报告里存不存在含这些词的证据」；挂错编号与编造编号都判不过，分别记 `off_topic` / `bogus`。锚点从整题共用改为**跟着 claim 走**，宽词（「数字人」「白皮书」）会让指标失去区分度 |
+| **Faithfulness（judge 层）**<br>语义支撑率 | judge 逐条判「该 claim 标注的来源是否**真的支撑**这条论断」，分母固定为题库 `must_cite` claim 数（judge 漏答按不支持计） | LLM judge | 与规则层**并列呈现**（不合并）。judge 必须同时看见「引用编号 → 片段原文」才能判，否则它的 `supported` 只是先验猜测；上一版实现只把 supported 的记 1 分再求均值，**恒等于 1.0**，一条都不支撑时又整条跳过不记 0 |
+| **claim 编号配对率** | 分子 = judge 成功抄回「这句话挂的是哪个编号」的 claim 数；分母 = 参与核验的 claim 数 | 元指标 | Faithfulness 规则层的**成立前提**：配对率不足 1 说明 judge 没照做，读数必须结合它看。`--no-judge` 时规则层不产出（不是 0） |
+| **引用准确率** | 拆两列：**带引用** = `must_cite` 的 claim 中合规标注的比例（分母 = 必引 claim 数）；**编号可解析** = 报告里出现的去重引用编号中，能在采集映射里找到的比例（分母 = 报告编号总数，防凭空编编号） | 规则层 | 依赖 `EVAL_CAPTURE=1`；未开时②为空 |
+| **平均工具调用次数** | `tool_start` 事件计数均值 | 过程层 | 超过题库 `max_tool_calls` 记「跑偏」并在报告标出 |
+| **P50 / P95 延迟** | `POST /api/task` → `task_result` 墙钟时间 | 过程层 | 30 题×3 次=90 样本，P95 统计上不稳，**同时看 P50** |
+| **单任务 API 成本** | monitor `token_usage` 事件累加的 usage，按 DeepSeek 峰谷分时价折算（元） | 过程层 | 缓存命中部分按 `cached_in` 单价；该事件由 `main_agent._run_agent_round` 逐次上报（**不上报则成本指标恒为空**，2026-10-15 首跑踩过） |
+
+**cite_kind 三种判据**（题库 `required_citations` 字段）：
+
+| cite_kind | 判据 | 适用 |
+|-----------|------|------|
+| `chunk` | 报告出现【引用BN-I】且该编号在本次采集映射里真实存在；带 `anchor_match: true` 时还要求该 chunk 含该 claim 自己的 `anchors` | KB / mixed 的 KB 部分 |
+| `query_cond` | 报告写明表名（`drugs` / `inventory` / `sales_records`） | DB 类 |
+| `url` | 报告出现 http(s) 链接 | web 类 |
+
+**哪些 claim 不进 Faithfulness**：`anchor_match` 只标在「证据是原文里一句话」的 fact 型 claim 上。跨文档对比、共同判断、背离点这类**综合型 claim**（kb-05 / kb-13 / mix-02 第二条 / mix-06）不给锚点——它们的证据不是一句可逐字比对的话，硬配锚点只会退化成送分；这类 claim 由 judge 单判。锚点写了要自检：
+
+```bash
+python -m app.eval.eval_agent --check-anchors   # 逐字命中校验，不跑 agent、不花 API 钱
+```
+
+MISS（语料里根本没这个串）直接失败——切块改版后锚点会静默失效，与其跑完一遍发现 Faithfulness 全 0，不如当场暴露；全库命中占比 >3% 记 BROAD（判据与检索层 `calibrate_retrieval` 同源）。题级 `faithfulness_anchors` 字段现在只作为语料存在性的补充清单，**不再参与判分**。
+
+### 10.3 DeepSeek 峰谷分时计价（deepseek-v4-flash）
+
+**高峰时段 = 北京时间 09:00–12:00 与 14:00–18:00**；其余（夜间、周末、法定节假日）为空闲时段，**闲时价 = 高峰价的一半**。
+
+| 项（元 / 百万 tokens） | 空闲时段 | 高峰时段 |
+|---|---|---|
+| 输入（缓存命中） | 0.02 | 0.04 |
+| 输入（未命中） | 1 | 2 |
+| 输出 | 4 | 8 |
+
+单任务成本估算（输入 40k + 输出 6k）：
+
+| 场景 | 单次 | 90 次（30 题 × 3） |
+|---|---|---|
+| 闲时 · 缓存未命中 | 0.064 | 约 5.8 元 |
+| 闲时 · 缓存命中 60% | 0.040 | 约 3.6 元 |
+| 高峰 · 缓存未命中 | 0.128 | 约 11.5 元 |
+| 高峰 · 缓存命中 60% | 0.081 | 约 7.3 元 |
+
+**跑批建议放夜间（00:30 之后）**，成本直接砍半。真正的成本是 token 与时长：90 次 × 2~6 分钟 ≈ 4~9 小时 GPU 占用，且会占住 embedding 容器，**不要和正常使用同时跑**。
+
+### 10.4 采集开关（`EVAL_CAPTURE`，默认关闭）
+
+引用准确率的「编号可解析」与 Faithfulness 都需要知道**每个引用编号背后到底是哪段原文**。为此 monitor 新增采集入口：
+
+- **默认 `EVAL_CAPTURE=0`**：采集代码完全不执行，线上零磁盘开销、零行为变化；
+- `EVAL_CAPTURE=1 EVAL_TRACE_DIR=<dir>`：知识库检索把「引用编号 → chunk（doc/heading/score/原文）」落盘；网络搜索只登记命中标题与 URL（不存正文，避免 trace 体积失控）；DB 工具落 `db_query` / `db_table_preview`（SQL 语句、列名、行数、前 100 行结果）——这一段是 2026-10-15 补的，此前 `db_calls` **恒为空数组**，DB 类题的「引用是否真实」退化成在报告里 grep 表名。
+
+落盘路径 `<dir>/<thread_id>/<工具名>.<序号>.json`，runner 用 `--trace-dir` 指向同一目录读取。
+
+**另一个必须知道的前提：执行层检索预算熔断**（ADR-021）。服务端 `TOOL_CALL_BUDGET`（默认 30）超限后，检索类工具**不再执行**，改为把「请基于已有材料收尾」的指令返回给模型。它直接改变延迟、工具调用次数与内容厚度这三个指标的读数——**跑批必须记录当时生效的预算值**，否则「P50 从 90 秒降到 60 秒」这种话分不清是优化还是被闸门掐断了。设为 0 即关闭。
+
+### 10.5 跑法
+
+```bash
+# 1) 带采集开关起服务（关掉时 Faithfulness 与「编号可解析」为空）
+EVAL_CAPTURE=1 EVAL_TRACE_DIR=app/eval/results/<run_id>/traces TOOL_CALL_BUDGET=30 \
+  python -m uvicorn app.api.server:app --port 8001
+
+# 1b) 题库锚点自检（不跑 agent、不花 API 钱；切块改版后必跑）
+python -m app.eval.eval_agent --check-anchors
+
+# 2) 小规模冒烟（建议先跑这个：2 题 × 1 次）
+python -m app.eval.eval_agent --ids db-03,kb-07 --repeat 1 --trace-dir app/eval/results/<run_id>/traces
+
+# 3) 正式跑批（挑夜间；单题超时默认 420s，旧值 900s）
+python -m app.eval.eval_agent --repeat 3 --trace-dir app/eval/results/<run_id>/traces
+
+# 只看过程指标、不花 judge 钱
+python -m app.eval.eval_agent --repeat 1 --no-judge
+```
+
+**先冒烟再全量**（2026-10-15 的教训：直接上 30 题，20 分钟内就撞上「一题 903 秒超时」和「一题 49 次检索不收尾」，而 runner 只在全部跑完才写报告，中途停等于全部作废）。
+
+产物：`app/eval/results/<run_id>/report.md`（人看的表）+ `summary.json`（逐题明细）。
