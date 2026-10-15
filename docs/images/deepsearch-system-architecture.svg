@@ -83,8 +83,8 @@
   <text x="443" y="675" text-anchor="middle" class="box-title">数据库查询助手</text>
   <text x="443" y="699" text-anchor="middle" class="box-text">list / preview / execute SQL</text>
   <rect x="612" y="648" width="230" height="72" class="box" stroke="#9333ea"/>
-  <text x="727" y="675" text-anchor="middle" class="box-title">RAGFlow 助手</text>
-  <text x="727" y="699" text-anchor="middle" class="box-text">助手列表 / 临时会话问答</text>
+  <text x="727" y="675" text-anchor="middle" class="box-title">知识库助手</text>
+  <text x="727" y="699" text-anchor="middle" class="box-text">自建 RAG 双路检索 + 片段综合</text>
   <rect x="896" y="648" width="300" height="72" class="box" stroke="#9333ea"/>
   <text x="1046" y="675" text-anchor="middle" class="box-title">文件交付工具</text>
   <text x="1046" y="697" text-anchor="middle" class="box-text">read_file_content / generate_markdown</text>
@@ -98,7 +98,7 @@
   <rect x="397" y="822" width="155" height="36" class="box" stroke="#475569"/>
   <text x="475" y="846" text-anchor="middle" class="box-text">MySQL 业务库</text>
   <rect x="602" y="822" width="155" height="36" class="box" stroke="#475569"/>
-  <text x="680" y="846" text-anchor="middle" class="box-text">RAGFlow 知识库</text>
+  <text x="680" y="846" text-anchor="middle" class="box-text">自建 RAG 知识库</text>
   <rect x="807" y="822" width="170" height="36" class="box" stroke="#475569"/>
   <text x="892" y="846" text-anchor="middle" class="box-text">updated/session</text>
   <rect x="1027" y="822" width="170" height="36" class="box" stroke="#475569"/>

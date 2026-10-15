@@ -14,6 +14,7 @@ deepsearch-agents 是一个面向复杂研究任务的对话式多智能体系�
 - **网络调用容错**：搜索等外部调用带「连接池重试 + 指数退避」，且失败时降级为可读错误交回模型决策（可换词重搜或改用其他信息源），不会因一次网络抖动作废整轮研搜；任务中途异常时保留已产出的部分结果并明确标注不完整。
 - 文件输入与输出：支持读取常见办公文档和文本文件，并生成 Markdown 或 PDF 报告。
 - 会话隔离：每次任务使用独立会话标识和输出目录，避免不同任务之间的数据相互干扰。
+- **会话持久化**：LangGraph checkpointer 落 Redis（`redis-stack` 镜像，AOF 落盘），同一会话的消息历史、虚拟文件系统与 todo 状态在服务重启后继续可用；Redis 不可达时自动回退进程内存，功能不中断。
 - 前后端分离：后端使用 FastAPI，前端使用 React、TypeScript、Vite 和 Ant Design。
 
 ## 工作流程
@@ -55,7 +56,7 @@ deepsearch-agents/
 │  ├─ embedding/          本地 embedding 模型辅助目录（bge-m3 权重放 .workbuddy/models/，不入 git）
 │  ├─ reranker/           精排模型目录（bge-reranker-v2-m3 + 导出的 ONNX，不入 git）
 │  ├─ mysql/mysql.sql     MySQL 初始化数据
-│  └─ docker-compose.yaml MySQL / embedding / Qdrant / Elasticsearch 的编排（Kibana、reranker 可选）
+│  └─ docker-compose.yaml MySQL / embedding / Qdrant / Elasticsearch / Redis 的编排（Kibana、reranker 可选）
 ├─ docs/                  项目文档和界面图片
 ├─ frontend/              React 前端
 ├─ .env.example           后端环境变量示例
@@ -204,7 +205,7 @@ python -m app.rag.ingest --force  # 全量重建（同时清理并重写 Qdrant 
 docker compose --env-file .env -f docker/docker-compose.yaml up -d
 ```
 
-该命令一次启动四个服务，每个都是可选的：
+该命令一次启动五个服务，每个都是可选的：
 
 | 服务 | 作用 | 缺失时的表现 |
 |------|------|--------------|
@@ -212,6 +213,7 @@ docker compose --env-file .env -f docker/docker-compose.yaml up -d
 | `embedding` | 本地 TEI（GPU 版）+ bge-m3，提供 1024 维向量 | 向量路缺席，仅关键词路 |
 | `qdrant` | 向量库，存放 chunk 向量 | 向量路缺席，仅关键词路 |
 | `elasticsearch` | 关键词索引（IK 中文分词，自建镜像） | 关键词路回退进程内 `rank-bm25` |
+| `redis` | 会话持久化（LangGraph checkpointer，AOF 落盘） | 回退进程内存，重启后会话历史丢失 |
 
 `elasticsearch` 使用本仓库 `docker/elasticsearch/` 下的自建镜像（官方镜像 + IK 中文分词插件，插件包随仓库提供，构建不联网），首次启动前先构建一次：
 
