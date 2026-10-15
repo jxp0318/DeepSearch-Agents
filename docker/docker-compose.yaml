@@ -15,6 +15,10 @@
 #   qdrant       向量库（见 ADR-007）：存放 chunk 向量，与关键词路组成双路检索
 #   elasticsearch 关键词检索路（见 ADR-008）：自建镜像装 IK 中文分词，
 #                与 Qdrant 对称——Qdrant 存向量、ES 存原文倒排索引
+#   redis        会话持久化（见 ADR-018）：langgraph checkpointer 的后端。
+#                必须用 redis-stack-server 镜像——langgraph-checkpoint-redis 依赖
+#                RedisJSON + RediSearch 两个模块，官方 redis 镜像不带。
+#                未启动时 checkpointer 自动回退进程内存（InMemorySaver，重启丢会话）。
 #   kibana       可选可视化（profile: kibana），按需启动：
 #                docker compose --env-file .env -f docker/docker-compose.yaml --profile kibana up -d kibana
 #   reranker     精排 cross-encoder（bge-reranker-v2-m3，profile: rerank），按需启动：
@@ -153,6 +157,27 @@ services:
       retries: 20
       start_period: 60s
 
+  redis:
+    # 会话持久化（见 ADR-018）：langgraph checkpointer 的 Redis 后端。
+    # 镜像必须用 redis-stack-server：RedisSaver 把 checkpoint 存成 RedisJSON 文档、
+    # 用 RediSearch 索引做 thread 检索，这两个模块官方 redis 镜像不带。
+    image: redis/redis-stack-server:7.4.0-v4
+    container_name: ds-redis
+    restart: unless-stopped
+    # appendonly：容器/机器重启后 checkpoint 不丢（对应 .env 的 REDIS_URL）
+    command: ["redis-stack-server", "--appendonly", "yes"]
+    ports:
+      # 默认 6380，避开本机其他项目 redis 容器已占用的 6379
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - deepsearch_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 6379 ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   kibana:
     # 可选可视化：ES 的数据浏览与检索调试（对应 Qdrant 自带的 dashboard）
     # 默认不启动，需要时用 --profile kibana 显式开启（镜像约 2.1GB）
@@ -225,3 +250,4 @@ volumes:
   deepsearch_qdrant_data:
   deepsearch_es_data:
   deepsearch_kibana_data:
+  deepsearch_redis_data:

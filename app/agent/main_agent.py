@@ -9,11 +9,14 @@
 """
 
 import asyncio
+import os
 import shutil
 from pathlib import Path
 
+import redis
 from deepagents import create_deep_agent
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.redis import AsyncRedisSaver
 
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
@@ -37,20 +40,122 @@ from app.tools.markdown_tools import generate_markdown
 from app.tools.pdf_tools import convert_md_to_pdf
 from app.tools.upload_file_read_tool import read_file_content
 
+# 知识库引用编号（【引用B批次-序号】）的批次号分配器，见 kb_tools 与 ADR-019
+from app.tools.kb_tools import warmup_ref_batch_counter
+
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件工具
 # 2. subagents 放网络、数据库、自建知识库（RAG）三类信息获取助手
 # 3. checkpointer 通过 thread_id 保存同一会话中的执行上下文
+class _LazySetupRedisSaver(AsyncRedisSaver):
+    """
+    惰性建索引的异步 Redis checkpointer。
+
+    两个约束决定了不能直接用 AsyncRedisSaver：
+
+    1. **索引必须在运行中的事件循环里建**。checkpointer 在模块导入期就要交给
+       create_deep_agent，此时没有事件循环；而 `asetup()` 会建 RediSearch 索引
+       并把当前 loop 捕获进 saver（库为这点专门做了延迟处理），所以推迟到第一次
+       真正读写 checkpoint 时才执行。
+    2. **必须用异步版**。主智能体跑的是 `astream`（异步路径），同步版 RedisSaver
+       只实现了同步方法，`aput` / `alist` 等落到基类默认实现 → NotImplementedError，
+       任务会在第一次调用时直接中断（InMemorySaver 自带异步方法所以不受影响）。
+
+    之所以还在构造函数里判活：导入期就用同步 redis 客户端 ping 一次，让
+    「Redis 不可达 → 回退 InMemorySaver」的降级决策在启动时一次做完，
+    而不是等到任务执行中途才炸。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ready = False
+
+    async def _ensure_ready(self) -> None:
+        if not self._ready:
+            await self.asetup()
+            self._ready = True
+
+    async def aget_tuple(self, config):
+        await self._ensure_ready()
+        return await super().aget_tuple(config)
+
+    async def alist(self, *args, **kwargs):
+        await self._ensure_ready()
+        return await super().alist(*args, **kwargs)
+
+    async def aput(self, *args, **kwargs):
+        await self._ensure_ready()
+        return await super().aput(*args, **kwargs)
+
+    async def aput_writes(self, *args, **kwargs):
+        await self._ensure_ready()
+        return await super().aput_writes(*args, **kwargs)
+
+    async def aget_channel_values(self, *args, **kwargs):
+        await self._ensure_ready()
+        return await super().aget_channel_values(*args, **kwargs)
+
+
+def _build_checkpointer():
+    """
+    构造 checkpointer：优先 Redis 持久化，失败自动回退进程内存。
+
+    Redis 后端（ADR-018）让同一 thread_id 的会话上下文（消息历史、虚拟文件
+    系统、todo 状态）在服务重启后仍然可用；REDIS_URL 未配置或 Redis 不可达时
+    回退 InMemorySaver——与检索层「可插拔降级」同一套约定：持久化缺席不阻断
+    核心功能，代价只是重启丢会话。
+
+    :return: BaseCheckpointSaver 实例
+    """
+    url = os.getenv("REDIS_URL", "").strip()
+    if not url:
+        return InMemorySaver()
+    try:
+        # 延迟导入：未装 langgraph-checkpoint-redis 的环境不应在 import 期崩溃
+        from langgraph.checkpoint.redis import AsyncRedisSaver
+
+        # 同步客户端探活：只在启动时建一次连接，导入期不占事件循环
+        redis.Redis.from_url(url, socket_connect_timeout=3).ping()
+
+        saver = _LazySetupRedisSaver(redis_url=url)
+        print(f"[MainAgent] checkpointer 已启用 Redis 持久化（{url}）")
+        return saver
+    except Exception as e:
+        print(f"[MainAgent] Redis 不可达（{e}），checkpointer 回退进程内存，重启后会话丢失")
+        return InMemorySaver()
+
+
 main_agent = create_deep_agent(
     model=model,
     system_prompt=main_agent_content["system_prompt"],
     tools=[generate_markdown, convert_md_to_pdf, read_file_content],
-    checkpointer=InMemorySaver(),
+    checkpointer=_build_checkpointer(),
     subagents=[database_query_agent, network_search_agent, knowledge_base_agent],
 )
 
 # 当前文件位于 app/agent/main_agent.py，parents[1] 即 app 目录
 project_root_path = Path(__file__).parents[1].resolve()
+
+
+def _cached_tokens(usage: dict) -> int:
+    """
+    从 usage_metadata 里取「缓存命中的输入 token 数」。
+
+    OpenAI 兼容协议把它放在 input_token_details.cached_tokens，但不同网关
+    （DeepSeek / OpenRouter / vLLM）字段名不完全一致，这里逐个兜底尝试；
+    取不到按 0 计——只是让成本估算偏保守（按未命中价算），不影响正确性。
+    """
+    details = usage.get("input_token_details") or usage.get("prompt_tokens_details") or {}
+    if isinstance(details, dict):
+        for key in ("cached_tokens", "cache_read_input_tokens", "cached_tokens_count"):
+            value = details.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+    for key in ("cached_tokens", "cache_read_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return 0
 
 
 async def _run_agent_round(message: str, config: dict) -> tuple[str, int]:
@@ -88,6 +193,16 @@ async def _run_agent_round(message: str, config: dict) -> tuple[str, int]:
             if usage and isinstance(usage, dict):
                 has_usage = True
                 round_tokens += int(usage.get("total_tokens") or 0)
+                # 逐次上报明细：评测的「单任务 API 成本」要按 DeepSeek 峰谷价
+                # 把输入/输出/缓存命中分别计价，只报总数无法折算（monitor 事件）
+                monitor.report_token_usage(
+                    {
+                        "input_tokens": int(usage.get("input_tokens") or 0),
+                        "output_tokens": int(usage.get("output_tokens") or 0),
+                        "total_tokens": int(usage.get("total_tokens") or 0),
+                        "cached_tokens": _cached_tokens(usage),
+                    }
+                )
 
             if node_name != "model":
                 continue
@@ -160,6 +275,12 @@ async def run_deep_agent(task_query, session_id):
     # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket thread_id
     session_dir_token = set_session_context(session_dir_str)
     session_id_token = set_thread_context(session_id)
+
+    # 预热知识库引用批次计数器（ADR-019）：放到线程池里跑，不阻塞事件循环。
+    # 目的有两个——Redis 可用时后续检索直接复用连接；不可用时退避状态在第一次
+    # 检索之前就确定，检索关键路径上不会付出连接代价。
+    counter_ready = await asyncio.to_thread(warmup_ref_batch_counter)
+    print(f"[MainAgent] 引用批次计数器：{'Redis 按会话自增' if counter_ready else '进程内计数器'}")
 
     # 新任务开始：清空该 thread 的历史事件缓冲，避免回放上一轮任务的轨迹
     monitor.begin_task()
