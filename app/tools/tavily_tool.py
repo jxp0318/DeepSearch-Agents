@@ -25,7 +25,13 @@ from requests.adapters import HTTPAdapter
 from tavily import TavilyClient
 from urllib3.util.retry import Retry
 
-from app.api.monitor import monitor
+from app.api.context import get_thread_context
+from app.api.monitor import (
+    check_call_budget,
+    eval_capture_enabled,
+    monitor,
+    register_tool_result,
+)
 
 load_dotenv()
 
@@ -170,7 +176,26 @@ def internet_search(
             "max_results": max_results,
             "include_raw_content": include_raw_content,
         },
+        retrieval=True,
     )
+
+    # 预算熔断：超上限后不再打网络，直接把收尾指令还给模型
+    # 返回结构与搜索失败的兜底一致（JSON），保持本工具的返回契约不变
+    blocked = check_call_budget("internet_search")
+    if blocked:
+        return json.dumps(
+            {
+                "error": True,
+                "reason": "工具调用预算已用尽",
+                "detail": blocked,
+                "query": query,
+                "guidance": (
+                    "本次网络搜索未执行。请立刻基于已经获取到的材料输出结论，"
+                    "不要再换词重试；未覆盖的部分明确说明「未获取到」，不要编造。"
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     started_at = time.time()
     try:
@@ -182,6 +207,23 @@ def internet_search(
             timeout=SEARCH_TIMEOUT,
         )
         print(f"[Tavily] 搜索成功，耗时 {time.time() - started_at:.1f}s")
+
+        # 评测采集（EVAL_CAPTURE=1 时）：登记命中的标题与 URL。
+        # 只存标题和链接、不存正文——网络类引用的判据是「报告给出的来源链接是否
+        # 真的来自本次检索」，不需要正文，也避免 trace 体积失控。
+        if eval_capture_enabled() and isinstance(result, dict):
+            register_tool_result(
+                get_thread_context(),
+                "web_search",
+                {
+                    "query": query,
+                    "results": [
+                        {"url": r.get("url", ""), "title": r.get("title", "")}
+                        for r in (result.get("results") or [])
+                    ],
+                },
+            )
+
         return result
     except Exception as exc:
         # 兜底：搜索失败不能把整轮任务连带作废，转成结构化错误交给模型决策

@@ -12,9 +12,41 @@ from dotenv import load_dotenv
 from langchain_core.tools import tool
 from mysql.connector import Error, connect
 
-from app.api.monitor import monitor
+from app.api.context import get_thread_context
+from app.api.monitor import (
+    check_call_budget,
+    eval_capture_enabled,
+    monitor,
+    register_tool_result,
+)
 
 load_dotenv()
+
+
+def _register_db_call(tool_name: str, sql: str, columns: list[str], rows: list) -> None:
+    """
+    登记本次 SQL 与返回结果（仅 EVAL_CAPTURE=1 时写盘）。
+
+    补这一段的原因：评测侧原先只有 kb / tavily 两个工具登记采集，`db_calls` 恒为空，
+    DB 类题目的「引用是否真实」退化成只在报告文本里 grep 表名，无法证明数字真来自查询结果。
+    :param tool_name: 工具名（文件名前缀须以 db 开头，runner 按此前缀归类）
+    :param sql: 实际执行的 SQL
+    :param columns: 结果列名
+    :param rows: fetchall 的原始行
+    """
+    if not eval_capture_enabled():
+        return
+    register_tool_result(
+        get_thread_context(),
+        tool_name,
+        {
+            "sql": sql,
+            "columns": list(columns),
+            "row_count": len(rows),
+            # 只留前 100 行：够核对数值，又不至于让采集文件随 LIMIT 100 之外膨胀
+            "rows": [[str(v) for v in row] for row in rows[:100]],
+        },
+    )
 
 
 # 集中读取数据库配置，后续三个工具都复用这份连接参数
@@ -117,7 +149,13 @@ def get_table_data(table_name) -> str:
     monitor.report_tool(
         tool_name="数据库表数据查询工具：get_table_data",
         args={"table_name": table_name},
+        retrieval=True,
     )
+
+    # 预算熔断：超上限后不再执行查询，把收尾指令还给模型
+    blocked = check_call_budget("get_table_data")
+    if blocked:
+        return blocked
 
     # 获取数据库参数
     config = get_db_config()
@@ -143,6 +181,9 @@ def get_table_data(table_name) -> str:
 
                 # fetchall 返回表数据，形如：[(1, "张三", 18), (2, "李四", 20)]
                 rows = cursor.fetchall()
+
+                # 登记本次预览的表与返回行，供评测核对「报告里的数是不是真来自这张表」
+                _register_db_call("db_table_preview", sql, columns, rows)
 
                 # 把每一行数据从元组转成 CSV 行文本
                 # 例如：(1, "张三", 18) -> "1,张三,18"
@@ -179,8 +220,15 @@ def execute_sql_query(query) -> str:
     """
     # 埋点：记录模型最终生成的 SQL，便于教学时观察是否真的落到了正确表字段上
     monitor.report_tool(
-        tool_name="数据库表数据查询工具：execute_sql_query", args={"query": query}
+        tool_name="数据库表数据查询工具：execute_sql_query",
+        args={"query": query},
+        retrieval=True,
     )
+
+    # 预算熔断：超上限后不再执行查询，把收尾指令还给模型
+    blocked = check_call_budget("execute_sql_query")
+    if blocked:
+        return blocked
 
     # 获取数据库参数
     config = get_db_config()
@@ -202,6 +250,9 @@ def execute_sql_query(query) -> str:
 
                 # rows => [(值1, 值2), (值1, 值2)]
                 rows = cursor.fetchall()
+
+                # 登记本次 SQL 与结果，供评测核对「报告里的数字是否真来自查询结果」
+                _register_db_call("db_query", query, columns, rows)
 
                 # 每行元组统一转为逗号分隔文本，便于模型读取和后续整理
                 results = [",".join(map(str, row)) for row in rows]

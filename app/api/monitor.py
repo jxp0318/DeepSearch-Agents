@@ -11,7 +11,10 @@ Agent 执行过程监控模块
 import asyncio
 import builtins
 import datetime
+import json
+import os
 import threading
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import WebSocket
@@ -22,6 +25,99 @@ from app.api.context import get_thread_context
 MAX_BUFFERED_EVENTS = 200
 # 最多保留多少个 thread 的事件缓冲，防止长时间运行的服务内存无上限增长
 MAX_BUFFERED_THREADS = 50
+
+# =============================================================================
+# 评测采集开关（生成层评测，见 eval.md 第 10 节）
+#
+# 默认关闭：线上运行时本模块只做「构造事件 + 推送」，不产生任何磁盘写入。
+# 打开（EVAL_CAPTURE=1）后，工具可以把**返回值**登记进来，评测 runner 据此判定：
+#   · 引用准确率 —— 报告里的【引用B3-2】是否真实存在、指向哪份文档哪一节
+#   · Faithfulness —— 报告论断是否能被引用的 chunk 原文支撑
+#
+# 为什么落盘而不是只放内存：一次跑批要跨进程核对（runner 与服务分进程），
+# 落盘到 results/<run_id>/ 目录最简单；关闭时连目录都不创建。
+# =============================================================================
+_EVAL_CAPTURE = os.getenv("EVAL_CAPTURE", "0") == "1"
+_EVAL_TRACE_DIR = os.getenv("EVAL_TRACE_DIR", "")
+
+# =============================================================================
+# 单任务工具调用预算（执行层硬刹车）
+#
+# 实测教训（2026-10-15 全量跑批）：题库的 `max_tool_calls` 只是评测侧**事后记账**的
+# 阈值，执行链根本不知道它存在。一次 kb-02 发了 37 次知识库检索 + 12 次网络检索
+# （题设上限 12），一道 db-05 卡到 900s 超时——模型「换词再搜」没有上界，反思轮数与
+# token 预算都拦不住这种单轮内的打转。
+#
+# 因此这里做真正的熔断：超过预算后**检索类工具不再执行**，而是把「请基于已有材料收尾」
+# 的指令返回给模型。上限取 30——高于题库最宽的 24（kb-13 / mix-06），不会误伤正常难题；
+# 置 0 或负数表示关闭该闸门。
+# =============================================================================
+TOOL_CALL_BUDGET = int(os.getenv("TOOL_CALL_BUDGET", "30"))
+
+
+def eval_capture_enabled() -> bool:
+    """评测采集是否开启（供工具层判断是否登记返回值）"""
+    return _EVAL_CAPTURE
+
+
+def check_call_budget(tool_name: str) -> Optional[str]:
+    """
+    检索类工具的预算闸门。
+
+    超预算时返回一段「立刻收尾」的指令文本——调用方把它原样 return 给模型，
+    **不再执行本次检索**；未超预算、或不在任务链路里（脚本直跑、无 thread_id）、
+    或闸门已关闭（`TOOL_CALL_BUDGET<=0`）时返回 None。
+
+    计的是**检索类调用次数**（知识库检索 / 网络搜索 / SQL 查询），不是所有工具调用：
+    预算的语义是「别再搜了，用已有材料收尾」，把生成报告也计入会导致出不了货。
+
+    :param tool_name: 调用方工具名，仅用于日志
+    """
+    if TOOL_CALL_BUDGET <= 0:
+        return None
+    thread_id = get_thread_context()
+    if not thread_id:
+        return None
+    used = monitor.retrieval_calls_used(thread_id)
+    if used <= TOOL_CALL_BUDGET:
+        return None
+    print(f"[Monitor] 预算熔断：{tool_name} 被拦（检索类已调用 {used} 次，上限 {TOOL_CALL_BUDGET}）")
+    return (
+        f"检索预算已用尽（本次是第 {used} 次取信息调用，上限 {TOOL_CALL_BUDGET} 次），"
+        "本次检索未执行。请立即基于已经获取到的材料输出结论："
+        "不要再生成新的检索或换词重试；材料没有覆盖到的部分明确写「未获取到」，不要编造。"
+    )
+
+
+def register_tool_result(thread_id: Optional[str], tool_name: str, payload: dict) -> None:
+    """
+    登记工具返回值（仅 EVAL_CAPTURE=1 时真正写盘）。
+
+    :param thread_id: 会话 ID；为空说明不在任务链路里，直接忽略
+    :param tool_name: 工具名
+    :param payload: 要保存的结构化内容（须可 JSON 序列化）
+    """
+    if not _EVAL_CAPTURE or not thread_id or not _EVAL_TRACE_DIR:
+        return
+    try:
+        target = Path(_EVAL_TRACE_DIR) / thread_id
+        target.mkdir(parents=True, exist_ok=True)
+        # 文件名带序号：同一 thread 内多次调用同一工具不会互相覆盖
+        seq = len(list(target.glob(f"{_safe_name(tool_name)}.*.json"))) + 1
+        path = target / f"{_safe_name(tool_name)}.{seq:03d}.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        # 采集失败绝不能影响主链路
+        print(f"[Monitor] EVAL_CAPTURE 登记失败（{tool_name}）：{e}")
+
+
+def _safe_name(name: str) -> str:
+    """把工具名里的中文与符号换成文件名安全字符"""
+    cleaned = "".join("_" if ch in '\\/:*?"<>|' or ord(ch) > 127 else ch for ch in name)
+    return cleaned.strip("_")[:60] or "tool"
 
 
 class ToolMonitor:
@@ -44,6 +140,10 @@ class ToolMonitor:
             cls._instance._event_seq: dict[str, int] = {}
             # 事件可能从线程池工具里发出，缓冲读写加锁保证安全
             cls._instance._buffer_lock = threading.Lock()
+            # thread_id -> 本任务已发生的工具调用次数（前端展示序号）
+            cls._instance._tool_calls: dict[str, int] = {}
+            # thread_id -> 其中**检索类**调用的次数（预算熔断只按这个判）
+            cls._instance._retrieval_calls: dict[str, int] = {}
         return cls._instance
 
     def set_websocket_manager(self, manager: "ConnectionManager") -> None:
@@ -63,6 +163,9 @@ class ToolMonitor:
         with self._buffer_lock:
             self._event_buffers.pop(thread_id, None)
             self._event_seq.pop(thread_id, None)
+            # 同一会话连续追问时预算重新计：每题一个新任务，不该被上一题用光
+            self._tool_calls.pop(thread_id, None)
+            self._retrieval_calls.pop(thread_id, None)
 
     def snapshot_events(self, thread_id: str) -> list[dict[str, Any]]:
         """
@@ -94,6 +197,40 @@ class ToolMonitor:
                     break
                 self._event_buffers.pop(oldest, None)
                 self._event_seq.pop(oldest, None)
+                self._tool_calls.pop(oldest, None)
+                self._retrieval_calls.pop(oldest, None)
+
+    def _count_tool_call(self, thread_id: Optional[str], retrieval: bool) -> tuple[int, int]:
+        """
+        累加本任务的调用计数，返回（总次数, 检索类次数）。
+
+        预算只看检索类：熔断的语义是「别再搜了」，不是「什么都别做」。生成 Markdown、
+        读附件这类调用如果也占配额，熔断会把收尾动作一起掐掉，反而产出空报告。
+        """
+        if not thread_id:
+            return 0, 0
+        with self._buffer_lock:
+            self._tool_calls[thread_id] = self._tool_calls.get(thread_id, 0) + 1
+            total = self._tool_calls[thread_id]
+            if retrieval:
+                self._retrieval_calls[thread_id] = self._retrieval_calls.get(thread_id, 0) + 1
+            return total, self._retrieval_calls.get(thread_id, 0)
+
+    def tool_calls_used(self, thread_id: Optional[str] = None) -> int:
+        """本任务已发生的工具调用总次数；未传 thread_id 时取当前上下文"""
+        thread_id = thread_id or get_thread_context()
+        if not thread_id:
+            return 0
+        with self._buffer_lock:
+            return self._tool_calls.get(thread_id, 0)
+
+    def retrieval_calls_used(self, thread_id: Optional[str] = None) -> int:
+        """本任务已发生的**检索类**调用次数（预算熔断的判断依据）"""
+        thread_id = thread_id or get_thread_context()
+        if not thread_id:
+            return 0
+        with self._buffer_lock:
+            return self._retrieval_calls.get(thread_id, 0)
 
     def _emit(
         self,
@@ -171,12 +308,25 @@ class ToolMonitor:
         self,
         tool_name: str,
         args: Optional[dict[str, Any]] = None,
+        retrieval: bool = False,
     ) -> None:
-        """报告开始执行某个工具"""
+        """
+        报告开始执行某个工具，并累加本任务的调用计数（预算熔断据此判断）
+
+        :param retrieval: 本次是否属于**取信息**的调用（知识库检索 / 网络搜索 / SQL 查询）。
+                          只有这类调用计入检索预算；生成报告、读附件不占配额，
+                          否则熔断会把「把已有材料写成报告」也一起掐掉，反而产出空结果。
+        """
+        call_index, retrieval_used = self._count_tool_call(get_thread_context(), retrieval)
         self._emit(
             "tool_start",
             f"开始执行工具: {tool_name}",
-            {"tool_name": tool_name, "args": args},
+            {
+                "tool_name": tool_name,
+                "args": args,
+                "call_index": call_index,
+                "retrieval_used": retrieval_used if retrieval else None,
+            },
         )
 
     def report_tool_error(
@@ -327,6 +477,16 @@ class ToolMonitor:
             f"工作目录已创建: {path}",
             {"path": path, "query": query},
         )
+
+    def report_token_usage(self, usage: dict) -> None:
+        """
+        上报一次模型调用的 token 用量。
+
+        用途：生成层评测的「单任务 API 成本」指标（eval.md §10.2）需要按
+        DeepSeek 峰谷价把 token 折算成钱，而这部分数据只存在于模型返回的
+        usage_metadata 里，不上报就无法统计。前端不消费此事件。
+        """
+        self._emit("token_usage", f"token 用量: {usage}", usage)
 
 
 monitor = ToolMonitor()
